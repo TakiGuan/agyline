@@ -450,7 +450,7 @@ mod win_watch {
     use std::thread;
     use std::time::{Duration, Instant};
 
-    use super::{win_reap, ORPHAN_MIN_AGE_SECS, ORPHAN_REAP_INTERVAL_SECS};
+    use super::win_reap;
 
     const SYNCHRONIZE: u32 = 0x0010_0000;
     const ERROR_ALREADY_EXISTS: u32 = 183;
@@ -458,9 +458,14 @@ mod win_watch {
     const WAIT_TIMEOUT: u32 = 0x0000_0102;
     const MAXIMUM_WAIT_OBJECTS: usize = 64;
     const WATCHER_MUTEX_NAME: &str = "Local\\agyline-watcher-v1";
-    const WATCH_POLL_TIMEOUT_MS: u32 = 5_000;
-    const EXIT_SETTLE_DELAY_MS: u64 = 500;
     const MULTI_INSTANCE_REAP_MIN_AGE_SECS: u64 = 2;
+
+    pub struct WatcherOptions {
+        pub poll_ms: u32,
+        pub exit_settle_ms: u64,
+        pub reap_interval_secs: u64,
+        pub reap_min_age_secs: u64,
+    }
 
     extern "system" {
         fn CreateMutexW(
@@ -521,7 +526,7 @@ mod win_watch {
     /// via `WaitForMultipleObjects` (0% CPU). Whenever any `agy.exe` exits, reaps orphaned
     /// suspended copies safely; once the last `agy.exe` exits, does a final `min_age=0`
     /// sweep and exits itself.
-    pub fn run_watcher() {
+    pub fn run_watcher(opts: WatcherOptions) {
         let name = to_wide_z(WATCHER_MUTEX_NAME);
         let mutex = unsafe { CreateMutexW(ptr::null_mut(), 0, name.as_ptr()) };
         if mutex.is_null() {
@@ -548,7 +553,7 @@ mod win_watch {
             }
 
             if raw_handles.is_empty() {
-                thread::sleep(Duration::from_millis(EXIT_SETTLE_DELAY_MS));
+                thread::sleep(Duration::from_millis(opts.exit_settle_ms));
                 let _ = win_reap::reap_orphaned_suspended_self(0);
                 break;
             }
@@ -558,7 +563,7 @@ mod win_watch {
                     raw_handles.len() as u32,
                     raw_handles.as_ptr(),
                     0, // Wake as soon as ANY monitored agy.exe exits.
-                    WATCH_POLL_TIMEOUT_MS,
+                    opts.poll_ms,
                 )
             };
 
@@ -567,7 +572,7 @@ mod win_watch {
             drop(guards);
 
             if wait_res >= WAIT_OBJECT_0 && (wait_res - WAIT_OBJECT_0) < MAXIMUM_WAIT_OBJECTS as u32 {
-                thread::sleep(Duration::from_millis(EXIT_SETTLE_DELAY_MS));
+                thread::sleep(Duration::from_millis(opts.exit_settle_ms));
                 if win_reap::list_live_agy_pids().is_empty() {
                     let _ = win_reap::reap_orphaned_suspended_self(0);
                     break;
@@ -576,8 +581,8 @@ mod win_watch {
                     last_periodic_reap = Instant::now();
                 }
             } else if wait_res == WAIT_TIMEOUT {
-                if last_periodic_reap.elapsed() >= Duration::from_secs(ORPHAN_REAP_INTERVAL_SECS) {
-                    let _ = win_reap::reap_orphaned_suspended_self(ORPHAN_MIN_AGE_SECS);
+                if last_periodic_reap.elapsed() >= Duration::from_secs(opts.reap_interval_secs) {
+                    let _ = win_reap::reap_orphaned_suspended_self(opts.reap_min_age_secs);
                     last_periodic_reap = Instant::now();
                 }
             } else {
@@ -587,15 +592,57 @@ mod win_watch {
     }
 }
 
-const SCRIPT_VERSION: &str = "2.0.6";
+const SCRIPT_VERSION: &str = "2.0.7";
 const GIT_CACHE_TTL_MS: i64 = 5_000;
 const GIT_CACHE_MAX_STALE_MS: i64 = 10 * 60 * 1_000;
 const GIT_REFRESH_TIMEOUT_MS: u64 = 10_000;
 const GIT_LOCK_STALE_SECS: u64 = 30;
+const WATCH_POLL_DEFAULT_MS: u32 = 30_000;
+const EXIT_SETTLE_DEFAULT_MS: u64 = 500;
 const ORPHAN_REAP_INTERVAL_SECS: u64 = 60;
 const ORPHAN_MIN_AGE_SECS: u64 = 15;
 const STDIN_TIMEOUT_MS: u64 = 250;
 const STDIN_MAX_BYTES: usize = 1024 * 1024;
+
+const DEFAULT_CONFIG_TOML: &str = r#"# agyline configuration (optional; zero-config works out of the box)
+# Place beside the executable as <exe_stem>.toml (e.g. statusline.toml) or agyline.toml.
+# Precedence: CLI flags > this file > built-in defaults.
+
+glyphs = "nerd"          # "nerd" | "classic"
+title = true             # Sync conversation_title to Windows Terminal tab
+
+[layout]
+width = "auto"           # "auto" or integer column count
+dir_style = "name"       # "name" | "parent" | "tilde"
+quota_mode = "used"      # "used" | "remaining"
+
+[git]
+fast = false             # true = read .git/HEAD only (skip git status)
+cache_ms = 5000          # SWR fresh cache TTL in ms (500..600000)
+timeout_ms = 10000       # Background git status timeout in ms (500..60000)
+
+[watcher]
+# Windows single-instance agy.exe exit watcher & orphan reaper
+enabled = true
+poll_ms = 30000          # Rescan interval for newly opened agy.exe (1000..300000)
+exit_settle_ms = 500     # Wait after agy exit before reaping (100..5000)
+reap_interval_secs = 60  # Periodic orphan reap interval (10..3600)
+reap_min_age_secs = 15   # Min age for periodic orphan reap (1..3600)
+
+[segments]
+model = true
+dir = true
+git = true
+context = true
+cache = true
+mode = true
+vim = true
+subagents = true
+tasks = true
+artifacts = true
+quota = true
+cost = true
+"#;
 
 static GIT_REFRESH_SPAWNED: AtomicBool = AtomicBool::new(false);
 
@@ -607,6 +654,7 @@ enum ActionMode {
     Version,
     Legend,
     Preview,
+    InitConfig,
     RefreshGit,
     ReapOrphans,
     WatchAgy,
@@ -642,6 +690,12 @@ struct Config {
     show_cost: bool,
     set_title: bool,
     watch_agy: bool,
+    git_cache_ms: i64,
+    git_timeout_ms: u64,
+    watch_poll_ms: u32,
+    exit_settle_ms: u64,
+    reap_interval_secs: u64,
+    reap_min_age_secs: u64,
     quota_mode: QuotaMode,
     dir_style: DirStyle,
     width_override: usize,
@@ -671,6 +725,12 @@ impl Default for Config {
             show_cost: true,
             set_title: true,
             watch_agy: true,
+            git_cache_ms: GIT_CACHE_TTL_MS,
+            git_timeout_ms: GIT_REFRESH_TIMEOUT_MS,
+            watch_poll_ms: WATCH_POLL_DEFAULT_MS,
+            exit_settle_ms: EXIT_SETTLE_DEFAULT_MS,
+            reap_interval_secs: ORPHAN_REAP_INTERVAL_SECS,
+            reap_min_age_secs: ORPHAN_MIN_AGE_SECS,
             quota_mode: QuotaMode::Used,
             dir_style: DirStyle::Name,
             width_override: 0,
@@ -682,30 +742,311 @@ impl Default for Config {
     }
 }
 
+fn strip_toml_comment(line: &str) -> &str {
+    let mut in_double = false;
+    let mut in_single = false;
+    let mut escaped = false;
+    for (idx, ch) in line.char_indices() {
+        if in_double {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_double = false;
+            }
+        } else if in_single {
+            if ch == '\'' {
+                in_single = false;
+            }
+        } else {
+            match ch {
+                '"' => in_double = true,
+                '\'' => in_single = true,
+                '#' => return &line[..idx],
+                _ => {}
+            }
+        }
+    }
+    line
+}
+
+fn parse_toml_string(val: &str) -> Option<String> {
+    let t = val.trim();
+    if t.len() >= 2 && t.starts_with('"') && t.ends_with('"') {
+        let mut out = String::new();
+        let mut chars = t[1..t.len() - 1].chars();
+        while let Some(c) = chars.next() {
+            if c == '\\' {
+                if let Some(esc) = chars.next() {
+                    match esc {
+                        'n' => out.push('\n'),
+                        't' => out.push('\t'),
+                        'r' => out.push('\r'),
+                        '\\' => out.push('\\'),
+                        '"' => out.push('"'),
+                        other => out.push(other),
+                    }
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        Some(out)
+    } else if t.len() >= 2 && t.starts_with('\'') && t.ends_with('\'') {
+        Some(t[1..t.len() - 1].to_string())
+    } else {
+        None
+    }
+}
+
+fn parse_toml_bool(val: &str) -> Option<bool> {
+    match val.trim() {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
+}
+
+fn parse_toml_u64(val: &str) -> Option<u64> {
+    val.trim().replace('_', "").parse::<u64>().ok()
+}
+
+fn find_sidecar_config_path() -> Option<PathBuf> {
+    let exe = env::current_exe().ok()?;
+    let dir = exe.parent()?;
+    if let Some(stem) = exe.file_stem().and_then(|s| s.to_str()) {
+        let stem_cfg = dir.join(format!("{stem}.toml"));
+        if stem_cfg.is_file() {
+            return Some(stem_cfg);
+        }
+    }
+    let default_cfg = dir.join("agyline.toml");
+    if default_cfg.is_file() {
+        return Some(default_cfg);
+    }
+    None
+}
+
+fn target_init_config_path() -> Option<PathBuf> {
+    let exe = env::current_exe().ok()?;
+    let dir = exe.parent()?;
+    let stem = exe
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("agyline");
+    Some(dir.join(format!("{stem}.toml")))
+}
+
 impl Config {
+    fn apply_toml(&mut self, content: &str) {
+        let clean = content.strip_prefix('\u{FEFF}').unwrap_or(content);
+        let mut section = String::new();
+        for raw_line in clean.lines() {
+            let line = strip_toml_comment(raw_line).trim();
+            if line.is_empty() {
+                continue;
+            }
+            if line.starts_with('[') && line.ends_with(']') && !line.starts_with("[[") {
+                section = line[1..line.len() - 1].trim().to_ascii_lowercase();
+                continue;
+            }
+            let Some((k_raw, v_raw)) = line.split_once('=') else {
+                continue;
+            };
+            let key = k_raw.trim().to_ascii_lowercase();
+            let val = v_raw.trim();
+
+            match (section.as_str(), key.as_str()) {
+                ("", "glyphs") => {
+                    if let Some(s) = parse_toml_string(val) {
+                        match s.trim().to_ascii_lowercase().as_str() {
+                            "classic" | "unicode" | "plain" => self.use_classic = true,
+                            "nerd" | "nerdfont" => self.use_classic = false,
+                            _ => {}
+                        }
+                    }
+                }
+                ("", "title") => {
+                    if let Some(b) = parse_toml_bool(val) {
+                        self.set_title = b;
+                    }
+                }
+                ("layout", "width") => {
+                    if let Some(s) = parse_toml_string(val) {
+                        if s.trim().eq_ignore_ascii_case("auto") {
+                            self.width_override = 0;
+                        }
+                    } else if let Some(n) = parse_toml_u64(val) {
+                        self.width_override = n as usize;
+                    }
+                }
+                ("layout", "dir_style") => {
+                    if let Some(s) = parse_toml_string(val) {
+                        match s.trim().to_ascii_lowercase().as_str() {
+                            "name" => self.dir_style = DirStyle::Name,
+                            "parent" => self.dir_style = DirStyle::Parent,
+                            "tilde" => self.dir_style = DirStyle::Tilde,
+                            _ => {}
+                        }
+                    }
+                }
+                ("layout", "quota_mode") => {
+                    if let Some(s) = parse_toml_string(val) {
+                        match s.trim().to_ascii_lowercase().as_str() {
+                            "used" => self.quota_mode = QuotaMode::Used,
+                            "remaining" => self.quota_mode = QuotaMode::Remaining,
+                            _ => {}
+                        }
+                    }
+                }
+                ("git", "fast") => {
+                    if let Some(b) = parse_toml_bool(val) {
+                        self.fast_git = b;
+                    }
+                }
+                ("git", "cache_ms") => {
+                    if let Some(n) = parse_toml_u64(val) {
+                        self.git_cache_ms = n.clamp(500, 600_000) as i64;
+                    }
+                }
+                ("git", "timeout_ms") => {
+                    if let Some(n) = parse_toml_u64(val) {
+                        self.git_timeout_ms = n.clamp(500, 60_000);
+                    }
+                }
+                ("watcher", "enabled") => {
+                    if let Some(b) = parse_toml_bool(val) {
+                        self.watch_agy = b;
+                    }
+                }
+                ("watcher", "poll_ms") => {
+                    if let Some(n) = parse_toml_u64(val) {
+                        self.watch_poll_ms = n.clamp(1_000, 300_000) as u32;
+                    }
+                }
+                ("watcher", "exit_settle_ms") => {
+                    if let Some(n) = parse_toml_u64(val) {
+                        self.exit_settle_ms = n.clamp(100, 5_000);
+                    }
+                }
+                ("watcher", "reap_interval_secs") => {
+                    if let Some(n) = parse_toml_u64(val) {
+                        self.reap_interval_secs = n.clamp(10, 3_600);
+                    }
+                }
+                ("watcher", "reap_min_age_secs") => {
+                    if let Some(n) = parse_toml_u64(val) {
+                        self.reap_min_age_secs = n.clamp(1, 3_600);
+                    }
+                }
+                ("segments", "model") => {
+                    if let Some(b) = parse_toml_bool(val) {
+                        self.show_model = b;
+                    }
+                }
+                ("segments", "dir") => {
+                    if let Some(b) = parse_toml_bool(val) {
+                        self.show_dir = b;
+                    }
+                }
+                ("segments", "git") => {
+                    if let Some(b) = parse_toml_bool(val) {
+                        self.show_git = b;
+                    }
+                }
+                ("segments", "context") => {
+                    if let Some(b) = parse_toml_bool(val) {
+                        self.show_context = b;
+                    }
+                }
+                ("segments", "cache") => {
+                    if let Some(b) = parse_toml_bool(val) {
+                        self.show_cache = b;
+                    }
+                }
+                ("segments", "mode") => {
+                    if let Some(b) = parse_toml_bool(val) {
+                        self.show_mode = b;
+                    }
+                }
+                ("segments", "vim") => {
+                    if let Some(b) = parse_toml_bool(val) {
+                        self.show_vim = b;
+                    }
+                }
+                ("segments", "subagents") => {
+                    if let Some(b) = parse_toml_bool(val) {
+                        self.show_subagents = b;
+                    }
+                }
+                ("segments", "tasks") => {
+                    if let Some(b) = parse_toml_bool(val) {
+                        self.show_tasks = b;
+                    }
+                }
+                ("segments", "artifacts") => {
+                    if let Some(b) = parse_toml_bool(val) {
+                        self.show_artifacts = b;
+                    }
+                }
+                ("segments", "quota") => {
+                    if let Some(b) = parse_toml_bool(val) {
+                        self.show_quota = b;
+                    }
+                }
+                ("segments", "cost") => {
+                    if let Some(b) = parse_toml_bool(val) {
+                        self.show_cost = b;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn load_with_args<I: IntoIterator<Item = String>>(iter: I) -> Self {
+        let mut cfg = Self::default();
+        if let Some(path) = find_sidecar_config_path() {
+            if let Ok(raw) = fs::read_to_string(path) {
+                cfg.apply_toml(&raw);
+            }
+        }
+        cfg.apply_args(iter);
+        cfg
+    }
+
+    #[cfg(test)]
     fn parse_args<I: IntoIterator<Item = String>>(iter: I) -> Self {
         let mut cfg = Self::default();
+        cfg.apply_args(iter);
+        cfg
+    }
+
+    fn apply_args<I: IntoIterator<Item = String>>(&mut self, iter: I) {
         let args: Vec<String> = iter.into_iter().collect();
         let mut idx = 0;
         while idx < args.len() {
             let a = args[idx].to_ascii_lowercase();
             match a.as_str() {
-                "--version" | "-version" | "-v" => cfg.action_mode = ActionMode::Version,
-                "--legend" | "-legend" | "-l" => cfg.action_mode = ActionMode::Legend,
-                "--preview" | "-preview" => cfg.action_mode = ActionMode::Preview,
+                "--version" | "-version" | "-v" => self.action_mode = ActionMode::Version,
+                "--legend" | "-legend" | "-l" => self.action_mode = ActionMode::Legend,
+                "--preview" | "-preview" => self.action_mode = ActionMode::Preview,
+                "--init-config" | "-initconfig" => self.action_mode = ActionMode::InitConfig,
                 "--refresh-git" | "refresh-git" => {
-                    cfg.action_mode = ActionMode::RefreshGit;
+                    self.action_mode = ActionMode::RefreshGit;
                     if idx + 1 < args.len() {
-                        cfg.refresh_git_dir = args[idx + 1].clone();
+                        self.refresh_git_dir = args[idx + 1].clone();
                         idx += 1;
                     }
                 }
-                "--reap-orphans" | "reap-orphans" => cfg.action_mode = ActionMode::ReapOrphans,
-                "--watch-agy" | "watch-agy" => cfg.action_mode = ActionMode::WatchAgy,
+                "--reap-orphans" | "reap-orphans" => self.action_mode = ActionMode::ReapOrphans,
+                "--watch-agy" | "watch-agy" => self.action_mode = ActionMode::WatchAgy,
                 "--min-age" | "-minage" => {
                     if idx + 1 < args.len() {
                         if let Ok(s) = args[idx + 1].trim().parse::<u64>() {
-                            cfg.reap_min_age = Some(s);
+                            self.reap_min_age = Some(s);
                         }
                         idx += 1;
                     }
@@ -714,7 +1055,7 @@ impl Config {
                     if idx + 1 < args.len() {
                         if let Ok(w) = args[idx + 1].trim().parse::<usize>() {
                             if w > 0 {
-                                cfg.width_override = w;
+                                self.width_override = w;
                             }
                         }
                         idx += 1;
@@ -723,9 +1064,9 @@ impl Config {
                 "--dir-style" | "-dirstyle" => {
                     if idx + 1 < args.len() {
                         match args[idx + 1].trim().to_ascii_lowercase().as_str() {
-                            "name" => cfg.dir_style = DirStyle::Name,
-                            "parent" => cfg.dir_style = DirStyle::Parent,
-                            "tilde" => cfg.dir_style = DirStyle::Tilde,
+                            "name" => self.dir_style = DirStyle::Name,
+                            "parent" => self.dir_style = DirStyle::Parent,
+                            "tilde" => self.dir_style = DirStyle::Tilde,
                             _ => {}
                         }
                         idx += 1;
@@ -734,8 +1075,8 @@ impl Config {
                 "--quota-mode" | "-quotamode" => {
                     if idx + 1 < args.len() {
                         match args[idx + 1].trim().to_ascii_lowercase().as_str() {
-                            "used" => cfg.quota_mode = QuotaMode::Used,
-                            "remaining" => cfg.quota_mode = QuotaMode::Remaining,
+                            "used" => self.quota_mode = QuotaMode::Used,
+                            "remaining" => self.quota_mode = QuotaMode::Remaining,
                             _ => {}
                         }
                         idx += 1;
@@ -747,34 +1088,33 @@ impl Config {
                 | "--no-nerdfont"
                 | "-nonerdfont"
                 | "--compatibility"
-                | "-compatibility" => cfg.use_classic = true,
-                "--fast-git" | "-fastgit" => cfg.fast_git = true,
-                "--no-model" | "-nomodel" => cfg.show_model = false,
-                "--no-dir" | "--no-cwd" | "-nodir" | "-nocwd" => cfg.show_dir = false,
-                "--no-git" | "--no-branch" | "-nogit" | "-nobranch" => cfg.show_git = false,
+                | "-compatibility" => self.use_classic = true,
+                "--fast-git" | "-fastgit" => self.fast_git = true,
+                "--no-model" | "-nomodel" => self.show_model = false,
+                "--no-dir" | "--no-cwd" | "-nodir" | "-nocwd" => self.show_dir = false,
+                "--no-git" | "--no-branch" | "-nogit" | "-nobranch" => self.show_git = false,
                 "--no-context" | "--no-context-usage" | "-nocontext" | "-nocontextusage" => {
-                    cfg.show_context = false
+                    self.show_context = false
                 }
-                "--no-cache" | "-nocache" => cfg.show_cache = false,
-                "--no-mode" | "-nomode" => cfg.show_mode = false,
-                "--no-vim" | "--no-vim-mode" | "-novim" | "-novimmode" => cfg.show_vim = false,
-                "--no-subagents" | "-nosubagents" => cfg.show_subagents = false,
-                "--no-tasks" | "-notasks" => cfg.show_tasks = false,
-                "--no-artifacts" | "-noartifacts" => cfg.show_artifacts = false,
+                "--no-cache" | "-nocache" => self.show_cache = false,
+                "--no-mode" | "-nomode" => self.show_mode = false,
+                "--no-vim" | "--no-vim-mode" | "-novim" | "-novimmode" => self.show_vim = false,
+                "--no-subagents" | "-nosubagents" => self.show_subagents = false,
+                "--no-tasks" | "-notasks" => self.show_tasks = false,
+                "--no-artifacts" | "-noartifacts" => self.show_artifacts = false,
                 "--no-activity" | "-noactivity" => {
-                    cfg.show_subagents = false;
-                    cfg.show_tasks = false;
-                    cfg.show_artifacts = false;
+                    self.show_subagents = false;
+                    self.show_tasks = false;
+                    self.show_artifacts = false;
                 }
-                "--no-quota" | "-noquota" => cfg.show_quota = false,
-                "--no-cost" | "-nocost" => cfg.show_cost = false,
-                "--no-title" | "-notitle" => cfg.set_title = false,
-                "--no-watch" | "-nowatch" => cfg.watch_agy = false,
+                "--no-quota" | "-noquota" => self.show_quota = false,
+                "--no-cost" | "-nocost" => self.show_cost = false,
+                "--no-title" | "-notitle" => self.set_title = false,
+                "--no-watch" | "-nowatch" => self.watch_agy = false,
                 _ => {}
             }
             idx += 1;
         }
-        cfg
     }
 }
 
@@ -1782,12 +2122,12 @@ fn get_reap_paths() -> (PathBuf, PathBuf) {
     )
 }
 
-fn is_reap_due(stamp_path: &Path) -> bool {
+fn is_reap_due(stamp_path: &Path, interval_secs: u64) -> bool {
     fs::metadata(stamp_path)
         .and_then(|m| m.modified())
         .ok()
         .and_then(|t| t.elapsed().ok())
-        .map(|age| age >= Duration::from_secs(ORPHAN_REAP_INTERVAL_SECS))
+        .map(|age| age >= Duration::from_secs(interval_secs))
         .unwrap_or(true)
 }
 
@@ -1803,16 +2143,16 @@ fn reap_orphans_now(stamp_path: &Path, min_age_secs: u64) {
     }
 }
 
-fn reap_orphans_if_due() {
+fn reap_orphans_if_due(cfg: &Config) {
     let (stamp_path, lock_path) = get_reap_paths();
-    if !is_reap_due(&stamp_path) {
+    if !is_reap_due(&stamp_path, cfg.reap_interval_secs) {
         return;
     }
-    if !try_claim_lock(&lock_path, Duration::from_secs(ORPHAN_REAP_INTERVAL_SECS)) {
+    if !try_claim_lock(&lock_path, Duration::from_secs(cfg.reap_interval_secs)) {
         return;
     }
     let _lock_guard = TempFileGuard(lock_path);
-    reap_orphans_now(&stamp_path, ORPHAN_MIN_AGE_SECS);
+    reap_orphans_now(&stamp_path, cfg.reap_min_age_secs);
 }
 
 fn reap_orphans_worker(min_age_secs: u64) {
@@ -1834,7 +2174,7 @@ fn maybe_ensure_agy_watcher() {
     }
 }
 
-fn maybe_spawn_detached_reap(watch_agy: bool) {
+fn maybe_spawn_detached_reap(cfg: &Config) {
     #[cfg(windows)]
     {
         // Skip spawning a second child when `--refresh-git` was already launched this turn
@@ -1842,7 +2182,7 @@ fn maybe_spawn_detached_reap(watch_agy: bool) {
         if GIT_REFRESH_SPAWNED.load(Ordering::Relaxed) {
             return;
         }
-        if watch_agy {
+        if cfg.watch_agy {
             // Fast path (<0.05ms): if the global single-instance watcher is active, it
             // already handles both exit-time and periodic reaping.
             if win_watch::is_watcher_running() {
@@ -1853,15 +2193,15 @@ fn maybe_spawn_detached_reap(watch_agy: bool) {
         }
         let (stamp_path, lock_path) = get_reap_paths();
         // On cold start when no stamp exists yet, seed the stamp instead of adding
-        // `CreateProcessW` latency to the first render; reaping will run 60s later.
+        // `CreateProcessW` latency to the first render; reaping will run later.
         if !stamp_path.exists() {
             let _ = fs::write(&stamp_path, now_unix_ms().to_string().as_bytes());
             return;
         }
-        if !is_reap_due(&stamp_path) {
+        if !is_reap_due(&stamp_path, cfg.reap_interval_secs) {
             return;
         }
-        if !try_claim_lock(&lock_path, Duration::from_secs(ORPHAN_REAP_INTERVAL_SECS)) {
+        if !try_claim_lock(&lock_path, Duration::from_secs(cfg.reap_interval_secs)) {
             return;
         }
         let Ok(exe) = env::current_exe() else {
@@ -1875,20 +2215,22 @@ fn maybe_spawn_detached_reap(watch_agy: bool) {
     }
     #[cfg(not(windows))]
     {
-        let _ = watch_agy;
+        let _ = cfg;
     }
 }
 
-fn refresh_git_worker(repo_dir: &str) {
+fn refresh_git_worker(repo_dir: &str, cfg: &Config) {
     if !repo_dir.trim().is_empty() {
         let (cache_path, lock_path) = get_git_cache_paths(repo_dir);
         let _lock_guard = TempFileGuard(lock_path);
-        if let Some(fresh) = query_git_status_now(repo_dir, GIT_REFRESH_TIMEOUT_MS) {
+        if let Some(fresh) = query_git_status_now(repo_dir, cfg.git_timeout_ms, cfg.git_cache_ms) {
             write_git_cache_atomic(&cache_path, &fresh);
         }
     }
-    reap_orphans_if_due();
-    maybe_ensure_agy_watcher();
+    reap_orphans_if_due(cfg);
+    if cfg.watch_agy {
+        maybe_ensure_agy_watcher();
+    }
 }
 
 fn run_git_status_with_timeout(repo_dir: &str, timeout_ms: u64) -> Option<String> {
@@ -1947,7 +2289,7 @@ fn run_git_status_with_timeout(repo_dir: &str, timeout_ms: u64) -> Option<String
     }
 }
 
-fn query_git_status_now(repo_dir: &str, timeout_ms: u64) -> Option<GitInfo> {
+fn query_git_status_now(repo_dir: &str, timeout_ms: u64, cache_ttl_ms: i64) -> Option<GitInfo> {
     if repo_dir.trim().is_empty() || !Path::new(repo_dir).is_dir() {
         return None;
     }
@@ -1999,7 +2341,7 @@ fn query_git_status_now(repo_dir: &str, timeout_ms: u64) -> Option<GitInfo> {
 
     Some(GitInfo {
         ts: now_unix_ms(),
-        ttl: GIT_CACHE_TTL_MS,
+        ttl: cache_ttl_ms,
         branch: sanitize_string(&branch),
         dirty,
         conflicts,
@@ -2052,7 +2394,12 @@ fn write_git_cache_atomic(cache_path: &Path, info: &GitInfo) {
     }
 }
 
-fn get_git_info(repo_dir: &str, vcs_obj: Option<&JsonValue>, fast_git: bool) -> Option<GitInfo> {
+fn get_git_info(
+    repo_dir: &str,
+    vcs_obj: Option<&JsonValue>,
+    fast_git: bool,
+    cache_ttl_ms: i64,
+) -> Option<GitInfo> {
     let payload_branch = sanitize_json_str(vcs_obj.and_then(|v| v.get("branch")));
     let payload_dirty_raw = vcs_obj.and_then(|v| v.get("dirty"));
     let payload_dirty = payload_dirty_raw.and_then(|v| v.as_bool()).unwrap_or(false);
@@ -2107,8 +2454,9 @@ fn get_git_info(repo_dir: &str, vcs_obj: Option<&JsonValue>, fast_git: bool) -> 
     let now_ms = now_unix_ms();
     if let Some(cached) = read_git_cache(&cache_path) {
         let age = now_ms - cached.ts;
+        let effective_ttl = cache_ttl_ms.min(cached.ttl.max(500));
         if cached.branch == fast_branch && age >= 0 {
-            if age <= cached.ttl {
+            if age <= effective_ttl {
                 return Some(cached);
             }
             if age <= GIT_CACHE_MAX_STALE_MS {
@@ -2387,7 +2735,7 @@ fn build_dir_item(data: &JsonValue, cfg: &Config, t: &Theme) -> Option<Item> {
 
 fn build_git_item(data: &JsonValue, cfg: &Config, t: &Theme) -> Option<Item> {
     let dir = extract_dir(data);
-    let info = get_git_info(&dir, data.get("vcs"), cfg.fast_git)?;
+    let info = get_git_info(&dir, data.get("vcs"), cfg.fast_git, cfg.git_cache_ms)?;
     if info.branch.is_empty() {
         return None;
     }
@@ -3103,7 +3451,7 @@ fn print_legend(t: &Theme) {
         "  --no-model, --no-dir, --no-git, --no-context, --no-cache".to_string(),
         "  --no-mode, --no-vim, --no-activity (--no-subagents/--no-tasks/--no-artifacts)".to_string(),
         "  --no-quota, --no-cost, --no-title, --no-watch".to_string(),
-        "  --preview [--width N], --legend, --version".to_string(),
+        "  --init-config, --preview [--width N], --legend, --version".to_string(),
     ];
     write_stdout_line(&lines.join("\n"));
 }
@@ -3196,13 +3544,28 @@ fn log_unexpected_error(msg: &str) {
     }
 }
 
+fn init_sidecar_config() {
+    let Some(path) = target_init_config_path() else {
+        write_stdout_line("Unable to resolve executable directory.");
+        return;
+    };
+    if path.exists() {
+        write_stdout_line(&format!("Config already exists: {}", path.display()));
+        return;
+    }
+    match fs::write(&path, DEFAULT_CONFIG_TOML) {
+        Ok(()) => write_stdout_line(&format!("Created config: {}", path.display())),
+        Err(e) => write_stdout_line(&format!("Failed to write {}: {e}", path.display())),
+    }
+}
+
 fn run() {
     #[cfg(windows)]
     unsafe {
         SetConsoleOutputCP(65001);
     }
 
-    let cfg = Config::parse_args(env::args().skip(1));
+    let cfg = Config::load_with_args(env::args().skip(1));
     let theme = Theme::new(cfg.use_classic, cfg.no_color);
 
     match cfg.action_mode {
@@ -3215,15 +3578,23 @@ fn run() {
         ActionMode::Preview => {
             print_preview(&cfg, &theme);
         }
+        ActionMode::InitConfig => {
+            init_sidecar_config();
+        }
         ActionMode::RefreshGit => {
-            refresh_git_worker(&cfg.refresh_git_dir);
+            refresh_git_worker(&cfg.refresh_git_dir, &cfg);
         }
         ActionMode::ReapOrphans => {
-            reap_orphans_worker(cfg.reap_min_age.unwrap_or(ORPHAN_MIN_AGE_SECS));
+            reap_orphans_worker(cfg.reap_min_age.unwrap_or(cfg.reap_min_age_secs));
         }
         ActionMode::WatchAgy => {
             #[cfg(windows)]
-            win_watch::run_watcher();
+            win_watch::run_watcher(win_watch::WatcherOptions {
+                poll_ms: cfg.watch_poll_ms,
+                exit_settle_ms: cfg.exit_settle_ms,
+                reap_interval_secs: cfg.reap_interval_secs,
+                reap_min_age_secs: cfg.reap_min_age_secs,
+            });
         }
         ActionMode::Render => {
             let input_json = read_bounded_stdin(STDIN_TIMEOUT_MS);
@@ -3235,7 +3606,7 @@ fn run() {
             }
             let rendered = render_status_line(&payload, &cfg, &theme);
             write_stdout_line(&rendered);
-            maybe_spawn_detached_reap(cfg.watch_agy);
+            maybe_spawn_detached_reap(&cfg);
         }
     }
 }
@@ -3422,5 +3793,66 @@ mod tests {
         let watch_cfg = Config::parse_args(vec!["--watch-agy".to_string()]);
         assert!(watch_cfg.action_mode == ActionMode::WatchAgy);
         assert!(watch_cfg.watch_agy);
+
+        let init_cfg = Config::parse_args(vec!["--init-config".to_string()]);
+        assert!(init_cfg.action_mode == ActionMode::InitConfig);
+    }
+
+    #[test]
+    fn test_toml_config_parsing_clamping_and_cli_override() {
+        let toml = r#"
+            # comment line
+            glyphs = "classic" # inline comment
+            title = false
+
+            [layout]
+            width = 120
+            dir_style = "parent"
+            quota_mode = "remaining"
+
+            [git]
+            fast = true
+            cache_ms = 2000
+            timeout_ms = 100 # clamped to 500
+
+            [watcher]
+            enabled = true
+            poll_ms = 500 # clamped to 1000
+            exit_settle_ms = 800
+            reap_interval_secs = 90
+            reap_min_age_secs = 5
+
+            [segments]
+            cost = false
+            vim = false
+        "#;
+        let mut cfg = Config::default();
+        cfg.apply_toml(toml);
+        assert!(cfg.use_classic);
+        assert!(!cfg.set_title);
+        assert_eq!(cfg.width_override, 120);
+        assert!(cfg.dir_style == DirStyle::Parent);
+        assert!(cfg.quota_mode == QuotaMode::Remaining);
+        assert!(cfg.fast_git);
+        assert_eq!(cfg.git_cache_ms, 2000);
+        assert_eq!(cfg.git_timeout_ms, 500);
+        assert!(cfg.watch_agy);
+        assert_eq!(cfg.watch_poll_ms, 1000);
+        assert_eq!(cfg.exit_settle_ms, 800);
+        assert_eq!(cfg.reap_interval_secs, 90);
+        assert_eq!(cfg.reap_min_age_secs, 5);
+        assert!(!cfg.show_cost);
+        assert!(!cfg.show_vim);
+        assert!(cfg.show_model);
+
+        // CLI flags must override TOML values.
+        cfg.apply_args(vec!["--no-watch".to_string(), "--width".to_string(), "96".to_string()]);
+        assert!(!cfg.watch_agy);
+        assert_eq!(cfg.width_override, 96);
+
+        // Built-in default template must parse cleanly without panics.
+        let mut def_cfg = Config::default();
+        def_cfg.apply_toml(DEFAULT_CONFIG_TOML);
+        assert_eq!(def_cfg.watch_poll_ms, WATCH_POLL_DEFAULT_MS);
     }
 }

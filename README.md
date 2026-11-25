@@ -6,7 +6,7 @@ A fast, zero-dependency, Cometix-style native Rust status line for [Antigravity 
 
 ## Features
 
-- **Zero external crates (`std` only)**: compiles offline in seconds into a ~500 KB single binary with sub-10 ms startup and no script-runtime overhead.
+- **Zero external crates (`std` only)**: compiles offline in seconds into a ~520 KB single binary with sub-10 ms startup, built-in JSON & TOML parsers, and no script-runtime overhead.
 - **Cometix-style visual layout**:
   - **Left**: active model (with per-family Nerd Font icons for Gemini, Claude, OpenAI/Codex, DeepSeek, Copilot) + reasoning effort, Vim mode, tool confirmation indicator, workspace directory, Git branch/status/ahead-behind, context usage, prompt cache hit ratio.
   - **Right**: `cycle_mode` (`plan` / `auto` / `accept-edits`), live activity (running subagents, background tasks, artifacts), model-aware `5H` / `7D` rolling quota usage & reset countdown, estimated session cost.
@@ -47,6 +47,52 @@ Add `statusLine` to `~/.gemini/antigravity-cli/settings.json`:
 }
 ```
 
+## Configuration File (Optional)
+
+`agyline` works out of the box with zero configuration. If you want to customize watcher timing, Git cache TTL, or visible segments without a long CLI command, generate a TOML config next to the binary:
+
+```bash
+agyline --init-config
+```
+
+On startup, `agyline` looks beside its own executable for `<exe_stem>.toml` first (for example `statusline.toml` when renamed to `statusline.exe`), then `agyline.toml`. Precedence is **CLI flags > TOML config > built-in defaults**.
+
+```toml
+glyphs = "nerd"          # "nerd" | "classic"
+title = true             # Sync conversation_title to Windows Terminal tab
+
+[layout]
+width = "auto"           # "auto" or integer column count
+dir_style = "name"       # "name" | "parent" | "tilde"
+quota_mode = "used"      # "used" | "remaining"
+
+[git]
+fast = false             # true = read .git/HEAD only (skip git status)
+cache_ms = 5000          # SWR fresh cache TTL in ms
+timeout_ms = 10000       # Background git status timeout in ms
+
+[watcher]
+enabled = true           # Windows single-instance agy.exe exit watcher
+poll_ms = 30000          # Rescan interval for newly opened agy.exe (1000..300000)
+exit_settle_ms = 500     # Wait after agy exit before reaping (100..5000)
+reap_interval_secs = 60  # Periodic orphan reap interval (10..3600)
+reap_min_age_secs = 15   # Min age for periodic orphan reap (1..3600)
+
+[segments]
+model = true
+dir = true
+git = true
+context = true
+cache = true
+mode = true
+vim = true
+subagents = true
+tasks = true
+artifacts = true
+quota = true
+cost = true
+```
+
 ## CLI Flags
 
 | Flag | Description |
@@ -59,6 +105,7 @@ Add `statusLine` to `~/.gemini/antigravity-cli/settings.json`:
 | `--no-watch` | Disable the single-instance Windows `agy.exe` exit watcher |
 | `--no-model`, `--no-dir`, `--no-git`, `--no-context`, `--no-cache` | Hide individual left segments |
 | `--no-mode`, `--no-vim`, `--no-activity`, `--no-quota`, `--no-cost` | Hide individual right segments |
+| `--init-config` | Write a commented default `.toml` config file beside the binary |
 | `--preview [--width N]` | Render sample payloads at wide, medium, and narrow widths |
 | `--legend` | Print segment legend and available flags |
 | `--version` | Print version string |
