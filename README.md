@@ -69,6 +69,7 @@ Set `NO_COLOR=1` to disable ANSI color output.
 
 - Visual design inspired by [Haleclipse/CCometixLine](https://github.com/Haleclipse/CCometixLine).
 - Antigravity CLI payload conventions informed by [weby-homelab/antigravity-cli-statusline](https://github.com/weby-homelab/antigravity-cli-statusline) and the official Antigravity CLI documentation.
+- Inspired by discussions and community sharing on [LINUX DO](https://linux.do).
 
 ## License
 
