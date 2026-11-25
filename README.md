@@ -13,7 +13,7 @@ A fast, zero-dependency, Cometix-style native Rust status line for [Antigravity 
 - **Zero-block Git SWR cache**: reads `.git/HEAD` directly on the render path and refreshes `git status` asynchronously in a detached background worker (using `CreateProcessW` with `bInheritHandles = FALSE` on Windows to avoid pipe hangs).
 - **4-step responsive layout**: gracefully shrinks right segments, then left segments, and wraps cleanly to two lines on narrow terminals.
 - **Windows Terminal tab title sync**: updates the shared console title to the active `conversation_title` via `SetConsoleTitleW` without polluting `stdout`.
-- **Windows orphan self-reaper**: periodically cleans up `0ms`-CPU `Suspended` orphaned copies of itself left behind when `cmd /c` is terminated mid-spawn, protected by 6 strict Win32 guards.
+- **Windows orphan self-reaper & exit watcher**: runs at most one global zero-CPU background watcher (`WaitForMultipleObjects` on live `agy.exe` handles) that automatically reaps `0ms`-CPU `Suspended` orphaned copies (including hot-swap `.old.*` backups) whenever an `agy` session exits, then exits cleanly once the last `agy` closes.
 
 ## Requirements
 
@@ -56,6 +56,7 @@ Add `statusLine` to `~/.gemini/antigravity-cli/settings.json`:
 | `--quota-mode used\|remaining` | Show quota as used % (default) or remaining % |
 | `--fast-git` | Read `.git/HEAD` only and skip background `git status` |
 | `--no-title` | Disable syncing `conversation_title` to the Windows Terminal tab title |
+| `--no-watch` | Disable the single-instance Windows `agy.exe` exit watcher |
 | `--no-model`, `--no-dir`, `--no-git`, `--no-context`, `--no-cache` | Hide individual left segments |
 | `--no-mode`, `--no-vim`, `--no-activity`, `--no-quota`, `--no-cost` | Hide individual right segments |
 | `--preview [--width N]` | Render sample payloads at wide, medium, and narrow widths |

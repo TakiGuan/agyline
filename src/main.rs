@@ -239,8 +239,59 @@ mod win_reap {
         stripped.replace('/', "\\").to_ascii_lowercase()
     }
 
+    pub(crate) fn is_self_or_old_backup(candidate_norm: &str, self_norm: &str) -> bool {
+        if candidate_norm == self_norm {
+            return true;
+        }
+        candidate_norm
+            .strip_prefix(self_norm)
+            .map(|rest| rest.starts_with(".old.") && rest.len() > 5)
+            .unwrap_or(false)
+    }
+
+    fn cleanup_unlocked_old_backups(self_exe: &Path) {
+        let Some(parent) = self_exe.parent() else {
+            return;
+        };
+        let Some(self_name) = self_exe.file_name().and_then(|n| n.to_str()) else {
+            return;
+        };
+        let old_prefix = format!("{}.old.", self_name.to_ascii_lowercase());
+        let Ok(entries) = std::fs::read_dir(parent) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+            if name.starts_with(&old_prefix) && name.len() > old_prefix.len() {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+
+    fn is_true_parent_alive(parent_pid: u32, child_create_100ns: u64, live_pids: &HashSet<u32>) -> bool {
+        if !live_pids.contains(&parent_pid) {
+            return false;
+        }
+        let h_parent = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, parent_pid) };
+        if h_parent.is_null() {
+            // Cannot inspect parent creation time; fail safe and treat as alive.
+            return true;
+        }
+        let _guard = HandleGuard(h_parent);
+        let mut c_ft = FileTime { dw_low_date_time: 0, dw_high_date_time: 0 };
+        let mut e_ft = FileTime { dw_low_date_time: 0, dw_high_date_time: 0 };
+        let mut k_ft = FileTime { dw_low_date_time: 0, dw_high_date_time: 0 };
+        let mut u_ft = FileTime { dw_low_date_time: 0, dw_high_date_time: 0 };
+        if unsafe { GetProcessTimes(h_parent, &mut c_ft, &mut e_ft, &mut k_ft, &mut u_ft) } == 0 {
+            return true;
+        }
+        // If the current process holding `parent_pid` started AFTER the child, Windows recycled the PID.
+        ft_to_u64(&c_ft) <= child_create_100ns
+    }
+
     /// Reaps orphaned, never-executed (`0ms` CPU, single-thread) instances of the exact
-    /// same `statusline.exe` binary left suspended when `cmd /c` is killed mid-spawn.
+    /// same `statusline.exe` binary (and any hot-swap `.old.*` backups in the same folder)
+    /// left suspended when `cmd /c` is killed mid-spawn.
     pub fn reap_orphaned_suspended_self(min_age_secs: u64) -> usize {
         let Ok(self_exe) = std::env::current_exe() else {
             return 0;
@@ -248,6 +299,8 @@ mod win_reap {
         let Some(self_name) = self_exe.file_name().and_then(|n| n.to_str()) else {
             return 0;
         };
+        let self_name_low = self_name.to_ascii_lowercase();
+        let self_old_prefix = format!("{self_name_low}.old.");
         let self_path_norm = normalize_win_path(&self_exe.to_string_lossy());
         let self_pid = std::process::id();
 
@@ -268,10 +321,10 @@ mod win_reap {
         }
         loop {
             live_pids.insert(entry.th32_process_id);
-            // Guard 1-3: exact exe filename, not self, single thread.
+            // Guard 1-3: exact exe filename (or `.old.*` backup), not self, single thread.
             if entry.th32_process_id != self_pid && entry.cnt_threads == 1 {
-                let exe_name = wide_z_to_string(&entry.sz_exe_file);
-                if exe_name.eq_ignore_ascii_case(self_name) {
+                let exe_name_low = wide_z_to_string(&entry.sz_exe_file).to_ascii_lowercase();
+                if exe_name_low == self_name_low || exe_name_low.starts_with(&self_old_prefix) {
                     candidates.push((entry.th32_process_id, entry.th32_parent_process_id));
                 }
             }
@@ -281,6 +334,7 @@ mod win_reap {
         }
 
         if candidates.is_empty() {
+            cleanup_unlocked_old_backups(&self_exe);
             return 0;
         }
 
@@ -294,10 +348,6 @@ mod win_reap {
 
         let mut reaped = 0usize;
         for (pid, parent_pid) in candidates {
-            // Guard 4: parent process must no longer be alive (true orphan).
-            if live_pids.contains(&parent_pid) {
-                continue;
-            }
             let h = unsafe {
                 OpenProcess(
                     PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE,
@@ -310,7 +360,7 @@ mod win_reap {
             }
             let _h_guard = HandleGuard(h);
 
-            // Guard 5: exact full executable path match.
+            // Guard 4: exact full executable path match (or same-directory `.old.*` backup).
             let mut img_buf = [0u16; 1024];
             let mut img_len = img_buf.len() as u32;
             if unsafe { QueryFullProcessImageNameW(h, 0, img_buf.as_mut_ptr(), &mut img_len) } == 0
@@ -318,13 +368,11 @@ mod win_reap {
                 continue;
             }
             let target_path = String::from_utf16_lossy(&img_buf[..img_len as usize]);
-            if normalize_win_path(&target_path) != self_path_norm {
-                // Also double-check filename in case of symlink/junction; never deviate from exact path.
-                let _ = Path::new(&target_path);
+            if !is_self_or_old_backup(&normalize_win_path(&target_path), &self_path_norm) {
                 continue;
             }
 
-            // Guard 6: 0.00ms CPU time (never executed a single instruction) AND older than min_age_secs.
+            // Guard 5: 0.00ms CPU time (never executed a single instruction) AND older than min_age_secs.
             let mut c_ft = FileTime {
                 dw_low_date_time: 0,
                 dw_high_date_time: 0,
@@ -348,6 +396,11 @@ mod win_reap {
             let kernel_100ns = ft_to_u64(&k_ft);
             let user_100ns = ft_to_u64(&u_ft);
 
+            // Guard 6: parent process must no longer be alive (accounting for Windows PID reuse).
+            if is_true_parent_alive(parent_pid, create_100ns, &live_pids) {
+                continue;
+            }
+
             if kernel_100ns == 0
                 && user_100ns == 0
                 && now_100ns.saturating_sub(create_100ns) >= min_age_100ns
@@ -358,11 +411,183 @@ mod win_reap {
             }
         }
 
+        cleanup_unlocked_old_backups(&self_exe);
         reaped
+    }
+
+    pub fn list_live_agy_pids() -> Vec<u32> {
+        let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+        if snap.is_null() || snap == INVALID_HANDLE {
+            return Vec::new();
+        }
+        let _snap_guard = HandleGuard(snap);
+
+        let mut pids = Vec::new();
+        let mut entry: ProcessEntry32W = unsafe { std::mem::zeroed() };
+        entry.dw_size = std::mem::size_of::<ProcessEntry32W>() as u32;
+
+        if unsafe { Process32FirstW(snap, &mut entry) } == 0 {
+            return pids;
+        }
+        loop {
+            let exe_name = wide_z_to_string(&entry.sz_exe_file);
+            if exe_name.eq_ignore_ascii_case("agy.exe") {
+                pids.push(entry.th32_process_id);
+            }
+            if unsafe { Process32NextW(snap, &mut entry) } == 0 {
+                break;
+            }
+        }
+        pids
     }
 }
 
-const SCRIPT_VERSION: &str = "2.0.5";
+#[cfg(windows)]
+mod win_watch {
+    use std::ffi::{c_void, OsStr};
+    use std::os::windows::ffi::OsStrExt;
+    use std::ptr;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    use super::{win_reap, ORPHAN_MIN_AGE_SECS, ORPHAN_REAP_INTERVAL_SECS};
+
+    const SYNCHRONIZE: u32 = 0x0010_0000;
+    const ERROR_ALREADY_EXISTS: u32 = 183;
+    const WAIT_OBJECT_0: u32 = 0x0000_0000;
+    const WAIT_TIMEOUT: u32 = 0x0000_0102;
+    const MAXIMUM_WAIT_OBJECTS: usize = 64;
+    const WATCHER_MUTEX_NAME: &str = "Local\\agyline-watcher-v1";
+    const WATCH_POLL_TIMEOUT_MS: u32 = 5_000;
+    const EXIT_SETTLE_DELAY_MS: u64 = 500;
+    const MULTI_INSTANCE_REAP_MIN_AGE_SECS: u64 = 2;
+
+    extern "system" {
+        fn CreateMutexW(
+            lp_mutex_attributes: *mut c_void,
+            b_initial_owner: i32,
+            lp_name: *const u16,
+        ) -> *mut c_void;
+        fn OpenMutexW(
+            dw_desired_access: u32,
+            b_inherit_handle: i32,
+            lp_name: *const u16,
+        ) -> *mut c_void;
+        fn OpenProcess(
+            dw_desired_access: u32,
+            b_inherit_handle: i32,
+            dw_process_id: u32,
+        ) -> *mut c_void;
+        fn WaitForMultipleObjects(
+            n_count: u32,
+            lp_handles: *const *mut c_void,
+            b_wait_all: i32,
+            dw_milliseconds: u32,
+        ) -> u32;
+        fn GetLastError() -> u32;
+        fn CloseHandle(h_object: *mut c_void) -> i32;
+    }
+
+    struct HandleGuard(*mut c_void);
+    impl Drop for HandleGuard {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe {
+                    CloseHandle(self.0);
+                }
+            }
+        }
+    }
+
+    fn to_wide_z(s: &str) -> Vec<u16> {
+        OsStr::new(s).encode_wide().chain(Some(0)).collect()
+    }
+
+    /// Fast (<0.05ms) check for whether the global single-instance watcher is already active.
+    pub fn is_watcher_running() -> bool {
+        let name = to_wide_z(WATCHER_MUTEX_NAME);
+        let h = unsafe { OpenMutexW(SYNCHRONIZE, 0, name.as_ptr()) };
+        if h.is_null() {
+            false
+        } else {
+            unsafe {
+                CloseHandle(h);
+            }
+            true
+        }
+    }
+
+    /// Global single-instance watcher: blocks in the kernel on all live `agy.exe` handles
+    /// via `WaitForMultipleObjects` (0% CPU). Whenever any `agy.exe` exits, reaps orphaned
+    /// suspended copies safely; once the last `agy.exe` exits, does a final `min_age=0`
+    /// sweep and exits itself.
+    pub fn run_watcher() {
+        let name = to_wide_z(WATCHER_MUTEX_NAME);
+        let mutex = unsafe { CreateMutexW(ptr::null_mut(), 0, name.as_ptr()) };
+        if mutex.is_null() {
+            return;
+        }
+        let _mutex_guard = HandleGuard(mutex);
+        if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+            return;
+        }
+
+        let mut last_periodic_reap = Instant::now();
+
+        loop {
+            let pids = win_reap::list_live_agy_pids();
+            let mut guards: Vec<HandleGuard> = Vec::with_capacity(pids.len().min(MAXIMUM_WAIT_OBJECTS));
+            let mut raw_handles: Vec<*mut c_void> = Vec::with_capacity(pids.len().min(MAXIMUM_WAIT_OBJECTS));
+
+            for pid in pids.into_iter().take(MAXIMUM_WAIT_OBJECTS) {
+                let h = unsafe { OpenProcess(SYNCHRONIZE, 0, pid) };
+                if !h.is_null() {
+                    raw_handles.push(h);
+                    guards.push(HandleGuard(h));
+                }
+            }
+
+            if raw_handles.is_empty() {
+                thread::sleep(Duration::from_millis(EXIT_SETTLE_DELAY_MS));
+                let _ = win_reap::reap_orphaned_suspended_self(0);
+                break;
+            }
+
+            let wait_res = unsafe {
+                WaitForMultipleObjects(
+                    raw_handles.len() as u32,
+                    raw_handles.as_ptr(),
+                    0, // Wake as soon as ANY monitored agy.exe exits.
+                    WATCH_POLL_TIMEOUT_MS,
+                )
+            };
+
+            // Release process handles before sleeping/reaping so exited processes can finalize.
+            drop(raw_handles);
+            drop(guards);
+
+            if wait_res >= WAIT_OBJECT_0 && (wait_res - WAIT_OBJECT_0) < MAXIMUM_WAIT_OBJECTS as u32 {
+                thread::sleep(Duration::from_millis(EXIT_SETTLE_DELAY_MS));
+                if win_reap::list_live_agy_pids().is_empty() {
+                    let _ = win_reap::reap_orphaned_suspended_self(0);
+                    break;
+                } else {
+                    let _ = win_reap::reap_orphaned_suspended_self(MULTI_INSTANCE_REAP_MIN_AGE_SECS);
+                    last_periodic_reap = Instant::now();
+                }
+            } else if wait_res == WAIT_TIMEOUT {
+                if last_periodic_reap.elapsed() >= Duration::from_secs(ORPHAN_REAP_INTERVAL_SECS) {
+                    let _ = win_reap::reap_orphaned_suspended_self(ORPHAN_MIN_AGE_SECS);
+                    last_periodic_reap = Instant::now();
+                }
+            } else {
+                break;
+            }
+        }
+    }
+}
+
+const SCRIPT_VERSION: &str = "2.0.6";
 const GIT_CACHE_TTL_MS: i64 = 5_000;
 const GIT_CACHE_MAX_STALE_MS: i64 = 10 * 60 * 1_000;
 const GIT_REFRESH_TIMEOUT_MS: u64 = 10_000;
@@ -384,6 +609,7 @@ enum ActionMode {
     Preview,
     RefreshGit,
     ReapOrphans,
+    WatchAgy,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -415,11 +641,13 @@ struct Config {
     show_quota: bool,
     show_cost: bool,
     set_title: bool,
+    watch_agy: bool,
     quota_mode: QuotaMode,
     dir_style: DirStyle,
     width_override: usize,
     action_mode: ActionMode,
     refresh_git_dir: String,
+    reap_min_age: Option<u64>,
     no_color: bool,
 }
 
@@ -442,11 +670,13 @@ impl Default for Config {
             show_quota: true,
             show_cost: true,
             set_title: true,
+            watch_agy: true,
             quota_mode: QuotaMode::Used,
             dir_style: DirStyle::Name,
             width_override: 0,
             action_mode: ActionMode::Render,
             refresh_git_dir: String::new(),
+            reap_min_age: None,
             no_color,
         }
     }
@@ -471,6 +701,15 @@ impl Config {
                     }
                 }
                 "--reap-orphans" | "reap-orphans" => cfg.action_mode = ActionMode::ReapOrphans,
+                "--watch-agy" | "watch-agy" => cfg.action_mode = ActionMode::WatchAgy,
+                "--min-age" | "-minage" => {
+                    if idx + 1 < args.len() {
+                        if let Ok(s) = args[idx + 1].trim().parse::<u64>() {
+                            cfg.reap_min_age = Some(s);
+                        }
+                        idx += 1;
+                    }
+                }
                 "--width" | "-width" => {
                     if idx + 1 < args.len() {
                         if let Ok(w) = args[idx + 1].trim().parse::<usize>() {
@@ -530,6 +769,7 @@ impl Config {
                 "--no-quota" | "-noquota" => cfg.show_quota = false,
                 "--no-cost" | "-nocost" => cfg.show_cost = false,
                 "--no-title" | "-notitle" => cfg.set_title = false,
+                "--no-watch" | "-nowatch" => cfg.watch_agy = false,
                 _ => {}
             }
             idx += 1;
@@ -1551,11 +1791,15 @@ fn is_reap_due(stamp_path: &Path) -> bool {
         .unwrap_or(true)
 }
 
-fn reap_orphans_now(stamp_path: &Path) {
+fn reap_orphans_now(stamp_path: &Path, min_age_secs: u64) {
     let _ = fs::write(stamp_path, now_unix_ms().to_string().as_bytes());
     #[cfg(windows)]
     {
-        let _ = win_reap::reap_orphaned_suspended_self(ORPHAN_MIN_AGE_SECS);
+        let _ = win_reap::reap_orphaned_suspended_self(min_age_secs);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = min_age_secs;
     }
 }
 
@@ -1568,21 +1812,43 @@ fn reap_orphans_if_due() {
         return;
     }
     let _lock_guard = TempFileGuard(lock_path);
-    reap_orphans_now(&stamp_path);
+    reap_orphans_now(&stamp_path, ORPHAN_MIN_AGE_SECS);
 }
 
-fn reap_orphans_worker() {
+fn reap_orphans_worker(min_age_secs: u64) {
     let (stamp_path, lock_path) = get_reap_paths();
     let _lock_guard = TempFileGuard(lock_path);
-    reap_orphans_now(&stamp_path);
+    reap_orphans_now(&stamp_path, min_age_secs);
 }
 
-fn maybe_spawn_detached_reap() {
+fn maybe_ensure_agy_watcher() {
+    #[cfg(windows)]
+    {
+        if win_watch::is_watcher_running() {
+            return;
+        }
+        let Ok(exe) = env::current_exe() else {
+            return;
+        };
+        let _ = win_detach::spawn_no_inherit(exe.as_os_str(), &["--watch-agy"]);
+    }
+}
+
+fn maybe_spawn_detached_reap(watch_agy: bool) {
     #[cfg(windows)]
     {
         // Skip spawning a second child when `--refresh-git` was already launched this turn
-        // (it piggybacks `reap_orphans_if_due()` in the background).
+        // (it piggybacks `reap_orphans_if_due()` and watcher startup in the background).
         if GIT_REFRESH_SPAWNED.load(Ordering::Relaxed) {
+            return;
+        }
+        if watch_agy {
+            // Fast path (<0.05ms): if the global single-instance watcher is active, it
+            // already handles both exit-time and periodic reaping.
+            if win_watch::is_watcher_running() {
+                return;
+            }
+            maybe_ensure_agy_watcher();
             return;
         }
         let (stamp_path, lock_path) = get_reap_paths();
@@ -1607,6 +1873,10 @@ fn maybe_spawn_detached_reap() {
             let _ = fs::remove_file(&lock_path);
         }
     }
+    #[cfg(not(windows))]
+    {
+        let _ = watch_agy;
+    }
 }
 
 fn refresh_git_worker(repo_dir: &str) {
@@ -1618,6 +1888,7 @@ fn refresh_git_worker(repo_dir: &str) {
         }
     }
     reap_orphans_if_due();
+    maybe_ensure_agy_watcher();
 }
 
 fn run_git_status_with_timeout(repo_dir: &str, timeout_ms: u64) -> Option<String> {
@@ -2831,7 +3102,7 @@ fn print_legend(t: &Theme) {
         "  --fast-git                     Read .git/HEAD only (skip git status subprocess)".to_string(),
         "  --no-model, --no-dir, --no-git, --no-context, --no-cache".to_string(),
         "  --no-mode, --no-vim, --no-activity (--no-subagents/--no-tasks/--no-artifacts)".to_string(),
-        "  --no-quota, --no-cost, --no-title".to_string(),
+        "  --no-quota, --no-cost, --no-title, --no-watch".to_string(),
         "  --preview [--width N], --legend, --version".to_string(),
     ];
     write_stdout_line(&lines.join("\n"));
@@ -2948,7 +3219,11 @@ fn run() {
             refresh_git_worker(&cfg.refresh_git_dir);
         }
         ActionMode::ReapOrphans => {
-            reap_orphans_worker();
+            reap_orphans_worker(cfg.reap_min_age.unwrap_or(ORPHAN_MIN_AGE_SECS));
+        }
+        ActionMode::WatchAgy => {
+            #[cfg(windows)]
+            win_watch::run_watcher();
         }
         ActionMode::Render => {
             let input_json = read_bounded_stdin(STDIN_TIMEOUT_MS);
@@ -2960,7 +3235,7 @@ fn run() {
             }
             let rendered = render_status_line(&payload, &cfg, &theme);
             write_stdout_line(&rendered);
-            maybe_spawn_detached_reap();
+            maybe_spawn_detached_reap(cfg.watch_agy);
         }
     }
 }
@@ -3111,13 +3386,41 @@ mod tests {
     fn test_win_reap_struct_layout_and_path_norm() {
         #[cfg(target_pointer_width = "64")]
         assert_eq!(std::mem::size_of::<win_reap::ProcessEntry32W>(), 568);
-        assert_eq!(
-            win_reap::normalize_win_path(r"\\?\C:\Users\Dev\.antigravity\statusline.exe"),
-            r"c:\users\dev\.antigravity\statusline.exe"
-        );
+        let base = win_reap::normalize_win_path(r"\\?\C:\Users\Dev\.antigravity\statusline.exe");
+        assert_eq!(base, r"c:\users\dev\.antigravity\statusline.exe");
         assert_eq!(
             win_reap::normalize_win_path("C:/Users/Dev/.antigravity/STATUSLINE.EXE "),
-            r"c:\users\dev\.antigravity\statusline.exe"
+            base
         );
+        assert!(win_reap::is_self_or_old_backup(&base, &base));
+        assert!(win_reap::is_self_or_old_backup(
+            r"c:\users\dev\.antigravity\statusline.exe.old.130902677",
+            &base
+        ));
+        assert!(!win_reap::is_self_or_old_backup(
+            r"c:\users\dev\.antigravity\statusline.exe.old.",
+            &base
+        ));
+        assert!(!win_reap::is_self_or_old_backup(
+            r"c:\other\statusline.exe.old.130902677",
+            &base
+        ));
+    }
+
+    #[test]
+    fn test_parse_watch_and_min_age_flags() {
+        let cfg = Config::parse_args(vec![
+            "--reap-orphans".to_string(),
+            "--min-age".to_string(),
+            "0".to_string(),
+            "--no-watch".to_string(),
+        ]);
+        assert!(cfg.action_mode == ActionMode::ReapOrphans);
+        assert_eq!(cfg.reap_min_age, Some(0));
+        assert!(!cfg.watch_agy);
+
+        let watch_cfg = Config::parse_args(vec!["--watch-agy".to_string()]);
+        assert!(watch_cfg.action_mode == ActionMode::WatchAgy);
+        assert!(watch_cfg.watch_agy);
     }
 }
