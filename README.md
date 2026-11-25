@@ -18,7 +18,11 @@ A fast, zero-dependency, Cometix-style native Rust status line for [Antigravity 
 - Rust toolchain (`cargo` / `rustc`, edition 2021)
 - A [Nerd Font](https://www.nerdfonts.com/) (v3.5+ recommended for native `nf-cod-claude` and `nf-cod-openai` glyphs), or pass `--classic` for plain Unicode fallback.
 
-## Build & Install
+## Download Prebuilt Binaries
+
+Prebuilt binaries for Windows (`x86_64`), Linux (`x86_64`), and macOS (`arm64` / `x86_64`) are published on the [GitHub Releases](https://github.com/TakiGuan/agyline/releases) page along with `SHA256SUMS.txt`.
+
+## Build from Source
 
 ```bash
 git clone https://github.com/TakiGuan/agyline.git
