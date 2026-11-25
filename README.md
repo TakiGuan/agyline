@@ -2,6 +2,8 @@
 
 A fast, zero-dependency, Cometix-style native Rust status line for [Antigravity CLI](https://antigravity.google/docs/cli/statusline) (`agy`).
 
+![agyline preview](assets/preview.png)
+
 ## Features
 
 - **Zero external crates (`std` only)**: compiles offline in seconds into a ~500 KB single binary with sub-10 ms startup and no script-runtime overhead.
