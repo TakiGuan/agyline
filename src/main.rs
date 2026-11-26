@@ -1280,7 +1280,7 @@ impl Theme {
                 "\u{F0F6}",
                 "\u{F0A38}", // nf-md-clipboard_text_outline
                 "\u{F140B}", // nf-md-lightning_bolt
-                "\u{F0CB6}", // nf-md-pencil_outline
+                "\u{F090C}", // nf-md-square_edit_outline
             )
         };
 
@@ -3858,7 +3858,7 @@ mod tests {
             for (mode, short, icon) in [
                 ("plan", "plan", if classic { "\u{2261}" } else { "\u{F0A38}" }),
                 ("auto", "auto", if classic { "\u{00BB}" } else { "\u{F140B}" }),
-                ("accept-edits", "edits", if classic { "\u{270E}" } else { "\u{F0CB6}" }),
+                ("accept-edits", "edits", if classic { "\u{270E}" } else { "\u{F090C}" }),
             ] {
                 let data = JsonParser::parse(&format!(r#"{{"cycle_mode":"{mode}"}}"#)).unwrap();
                 let item = build_mode_item(&data, &theme).unwrap();
