@@ -13,7 +13,7 @@ A fast, zero-dependency, Cometix-style native Rust status line for [Antigravity 
 - **Zero-block Git SWR cache**: reads `.git/HEAD` directly on the render path and refreshes `git status` asynchronously in a detached background worker (using `CreateProcessW` with `bInheritHandles = FALSE` on Windows to avoid pipe hangs).
 - **4-step responsive layout**: gracefully shrinks right segments, then left segments, and wraps cleanly to two lines on narrow terminals.
 - **State-aware terminal titles**: `--title` prints a plain-text title for agy's native `title.command`. On Windows, the existing watcher animates working and action-required indicators once per second and clears the completion indicator after five seconds. Direct Windows console title sync remains available for existing configurations.
-- **Native terminal bell notifications on Windows**: work returning to idle and entering tool confirmation each emit one BEL notification through the session's console. Repeated callbacks and animation frames do not repeat the notification.
+- **Native terminal bell notifications on Windows**: work returning to idle, entering tool confirmation, and entering an error state each emit one BEL notification through the session's console. Repeated callbacks and animation frames do not repeat the notification.
 - **Windows orphan self-reaper & exit watcher**: one global background watcher waits on live `agy.exe` handles, title updates, and animation deadlines. It automatically reaps `0ms`-CPU `Suspended` orphaned copies (including hot-swap `.old.*` backups) whenever an `agy` session exits, then exits cleanly once the last `agy` closes. Process scans and periodic reaping keep their own slower schedules.
 
 ## Requirements
@@ -61,23 +61,23 @@ Titles keep the conversation name, falling back to the workspace directory or `A
 | State | Prefix |
 | :--- | :--- |
 | Tool confirmation pending, before any other state | `[ ! ]` ↔ `[ . ]` |
-| Working, using tools, or reviewing | `◐` ↔ `◑` |
-| Initializing or authenticating | `◐` ↔ `◑` |
-| Idle with running background tasks or subagents | `◐` ↔ `◑` |
-| Work or confirmation changes to idle, with no background work | `🟢` for five seconds, then no prefix |
+| Working, using tools, or reviewing | `[ / ]` ↔ `[ \ ]` |
+| Initializing or authenticating | `[ / ]` ↔ `[ \ ]` |
+| Idle with running background tasks or subagents | `[ / ]` ↔ `[ \ ]` |
+| Work or confirmation changes to idle, with no background work | `[ ✓ ]` for five seconds, then no prefix |
 | Initial idle or idle after an error | No prefix |
-| Error | `🔴`, cleared on the next state change |
+| Error | `[ x ]`, cleared on the next state change |
 | Missing or unknown state | No prefix |
 
-For example: `◐ Fix authentication` alternates with `◑ Fix authentication`. When work ends, it becomes `🟢 Fix authentication`, then `Fix authentication` after five seconds. Repeated idle callbacks do not extend the green indicator. A new conversation starts with fresh state. The green circle means agy returned to idle, including after cancellation, rather than asserting that the task or its tests succeeded.
+For example: `[ / ] Fix authentication` alternates with `[ \ ] Fix authentication`. When work ends, it becomes `[ ✓ ] Fix authentication`, then `Fix authentication` after five seconds. Repeated idle callbacks do not extend the completion indicator. A new conversation starts with fresh state. The completion badge means agy returned to idle, including after cancellation, rather than asserting that the task or its tests succeeded.
 
 Each animation frame lasts 1,000 ms, so a full cycle lasts two seconds. The existing Windows watcher handles animation in its wait loop, with no additional resident process or animation thread. Callbacks hand off small state files under the user's temporary directory, keyed by agy's process ID and creation time. The watcher checks that identity before attaching to each console and removes stale session files. The `--title` path skips Git lookups.
 
-The watcher also sends a single BEL (`U+0007`) when work returns to idle or tool confirmation first becomes pending. It writes directly to the matching console, keeping captured status line and title output free of notification control characters. Initial idle, errors, and repeated callbacks do not ring. Pending notifications are consumed before delivery to avoid duplicates after a watcher restart, and notifications older than five seconds are discarded. A process interruption or an unavailable console can therefore drop a notification.
+The watcher also sends a single BEL (`U+0007`) when work returns to idle, tool confirmation first becomes pending, or the session enters an error state. It writes directly to the matching console, keeping captured status line and title output free of notification control characters. Initial idle and repeated callbacks do not ring. Pending notifications are consumed before delivery to avoid duplicates after a watcher restart, and notifications older than five seconds are discarded. A process interruption or an unavailable console can therefore drop a notification.
 
-Windows Terminal controls the bell indicator and any sound or flashing through its existing settings, including `bellStyle`. agyline does not change those settings or track tab focus. The green completion circle keeps its existing five-second lifetime, independently of the terminal's bell indicator.
+Windows Terminal controls the bell indicator and any sound or flashing through its existing settings, including `bellStyle`. agyline does not change those settings or track tab focus. The `[ ✓ ]` completion badge keeps its existing five-second lifetime, independently of the terminal's bell indicator.
 
-Titles are sanitized, limited to 60 display columns including the prefix, and contain no ANSI styling or Nerd Font icons. Their appearance depends on the terminal's title font. Emoji circle colors are supplied by the system font and cannot follow Nord palette values exactly.
+Titles are sanitized, limited to 60 display columns including the prefix, and contain no ANSI styling, color emoji, or Nerd Font icons. Their appearance depends on the terminal's title font.
 
 Linux, macOS, `--no-watch`, and calls outside an agy process tree use a static first frame and plain idle title. They do not track completion or emit bell notifications. Existing Windows configurations without `title.command` use the same animation and notifications through direct title sync unless `--no-title` or `title = false` is set. When replacing a running installation, restart its watcher or close all agy sessions before reopening them, so the new watcher code is loaded.
 

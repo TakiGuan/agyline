@@ -3890,13 +3890,13 @@ mod tests {
     #[test]
     fn test_terminal_title_states_and_attention_priority() {
         for (state, prefix) in [
-            ("working", "\u{25D0}"),
-            ("tool_use", "\u{25D0}"),
-            ("reviewing", "\u{25D0}"),
-            ("initializing", "\u{25D0}"),
-            ("authenticating", "\u{25D0}"),
+            ("working", "[ / ]"),
+            ("tool_use", "[ / ]"),
+            ("reviewing", "[ / ]"),
+            ("initializing", "[ / ]"),
+            ("authenticating", "[ / ]"),
             ("idle", ""),
-            ("error", "\u{1F534}"),
+            ("error", "[ x ]"),
         ] {
             let data = JsonParser::parse(&format!(
                 r#"{{"agent_state":"{state}","conversation_title":"Fix authentication"}}"#,
@@ -3917,7 +3917,7 @@ mod tests {
             r#"{"agent_state":"idle","subagents":[{"status":"running"}]}"#,
             r#"{"agent_state":"idle","subagents":[{"name":"worker"}]}"#,
         ] {
-            assert_eq!(resolve_terminal_title(&JsonParser::parse(raw).unwrap()), "\u{25D0} Antigravity");
+            assert_eq!(resolve_terminal_title(&JsonParser::parse(raw).unwrap()), "[ / ] Antigravity");
         }
         let completed = JsonParser::parse(r#"{"agent_state":"idle","task_count":0,"subagents":[{"status":"completed"}]}"#).unwrap();
         assert_eq!(resolve_terminal_title(&completed), "Antigravity");
@@ -3930,14 +3930,14 @@ mod tests {
         let data = JsonParser::parse(
             r#"{"conversation_title":"  Fix\t\u001b[31mauth\u001b[0m\n\u202ereview\u2069\u009d\u001b]0;injected\u0007  ","agent_state":"working"}"#,
         ).unwrap();
-        assert_eq!(resolve_terminal_title(&data), "\u{25D0} Fix auth review");
+        assert_eq!(resolve_terminal_title(&data), "[ / ] Fix auth review");
         let invisible = JsonParser::parse(r#"{"conversation_title":"\u202e\u2069","cwd":"/work/demo"}"#).unwrap();
         assert_eq!(resolve_terminal_title(&invisible), "demo");
         let long = JsonParser::parse(&format!(
             r#"{{"agent_state":"working","conversation_title":"{}"}}"#, "界".repeat(80),
         )).unwrap();
         let title = resolve_terminal_title(&long);
-        assert!(title.starts_with("\u{25D0} "));
+        assert!(title.starts_with("[ / ] "));
         assert!(title.ends_with('\u{2026}'));
         assert!(display_width(&title) <= 60);
     }

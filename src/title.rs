@@ -102,9 +102,10 @@ impl TitleState {
             .map_or(now_ms, |old| old.since_ms);
         let bell_pending = previous
             .filter(|old| old.status == status)
-            .map_or(matches!(status, Status::Done | Status::Attention), |old| {
-                old.bell_pending
-            });
+            .map_or(
+                matches!(status, Status::Done | Status::Attention | Status::Error),
+                |old| old.bell_pending,
+            );
         Self {
             conversation,
             name: terminal_title_name(data),
@@ -117,7 +118,7 @@ impl TitleState {
     fn render(&self, now_ms: u64) -> String {
         let elapsed = now_ms.saturating_sub(self.since_ms);
         let second_frame = (elapsed / FRAME_MS) % 2 == 1;
-        let working = if second_frame { "◑" } else { "◐" };
+        let working = if second_frame { "[ \\ ]" } else { "[ / ]" };
         let prefix = match self.status {
             Status::Working | Status::Starting | Status::SigningIn | Status::Background => working,
             Status::Attention => {
@@ -127,8 +128,8 @@ impl TitleState {
                     "[ ! ]"
                 }
             }
-            Status::Done if elapsed < DONE_MS => "🟢",
-            Status::Error => "🔴",
+            Status::Done if elapsed < DONE_MS => "[ ✓ ]",
+            Status::Error => "[ x ]",
             _ => "",
         };
         if prefix.is_empty() {
@@ -468,7 +469,10 @@ pub(super) mod windows {
                 // Consume before writing to the console, so a restart cannot repeat the bell.
                 bell = fs::write(session.path(), encode(&state)).is_ok()
                     && now.saturating_sub(state.since_ms) < DONE_MS
-                    && matches!(state.status, Status::Done | Status::Attention);
+                    && matches!(
+                        state.status,
+                        Status::Done | Status::Attention | Status::Error
+                    );
             }
             session.set_title(&state.render(now), bell);
             if let Some(delay) = state.next_tick_ms(now) {
@@ -515,11 +519,11 @@ mod tests {
     #[test]
     fn fixed_frames_survive_callbacks_and_state_changes() {
         let working = TitleState::update(None, &payload("working", "A"), 100);
-        assert_eq!(working.render(1099), "◐ Session A");
-        assert_eq!(working.render(1100), "◑ Session A");
+        assert_eq!(working.render(1099), "[ / ] Session A");
+        assert_eq!(working.render(1100), "[ \\ ] Session A");
         let working = TitleState::update(Some(&working), &payload("tool_use", "A"), 1500);
-        assert_eq!(working.render(2099), "◑ Session A");
-        assert_eq!(working.render(2100), "◐ Session A");
+        assert_eq!(working.render(2099), "[ \\ ] Session A");
+        assert_eq!(working.render(2100), "[ / ] Session A");
         assert_eq!(working.next_tick_ms(1500), Some(600));
         let pending = JsonParser::parse(
             r#"{"conversation_id":"A","agent_state":"error","tool_confirmation_pending":true}"#,
@@ -537,14 +541,14 @@ mod tests {
         assert_eq!(TitleState::update(None, &idle, 0).render(0), "Session A");
         let working = TitleState::update(None, &payload("working", "A"), 100);
         let done = TitleState::update(Some(&working), &idle, 200);
-        assert_eq!(done.render(5199), "🟢 Session A");
+        assert_eq!(done.render(5199), "[ ✓ ] Session A");
         assert_eq!(done.next_tick_ms(5199), Some(1));
         assert_eq!(done.render(5200), "Session A");
         assert_eq!(done.next_tick_ms(5200), None);
         let repeat = TitleState::update(Some(&done), &idle, 9000);
         assert_eq!(repeat.render(9000), "Session A");
         let restart = TitleState::update(Some(&done), &payload("working", "A"), 300);
-        assert_eq!(restart.render(300), "◐ Session A");
+        assert_eq!(restart.render(300), "[ / ] Session A");
     }
 
     #[test]
@@ -553,7 +557,7 @@ mod tests {
         let other = TitleState::update(Some(&working), &payload("idle", "B"), 100);
         assert_eq!(other.render(100), "Session B");
         let error = TitleState::update(Some(&working), &payload("error", "A"), 100);
-        assert_eq!(error.render(100), "🔴 Session A");
+        assert_eq!(error.render(100), "[ x ] Session A");
         assert_eq!(error.next_tick_ms(100), None);
         let recovered = TitleState::update(Some(&error), &payload("idle", "A"), 200);
         assert_eq!(recovered.render(200), "Session A");
@@ -591,7 +595,12 @@ mod tests {
 
         assert!(!TitleState::update(None, &idle, 0).bell_pending);
         assert!(!TitleState::update(Some(&done), &payload("idle", "B"), 900).bell_pending);
-        assert!(!TitleState::update(Some(&working), &payload("error", "A"), 900).bell_pending);
+        let error = TitleState::update(Some(&working), &payload("error", "A"), 900);
+        assert!(error.bell_pending);
+        let mut repeated_error = TitleState::update(Some(&error), &payload("error", "A"), 950);
+        assert!(repeated_error.bell_pending);
+        repeated_error.bell_pending = false;
+        assert!(!TitleState::update(Some(&repeated_error), &payload("error", "A"), 1000).bell_pending);
         let background =
             JsonParser::parse(r#"{"conversation_id":"A","agent_state":"idle","task_count":1}"#)
                 .unwrap();
