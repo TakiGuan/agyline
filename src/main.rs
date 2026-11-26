@@ -13,6 +13,8 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+mod title;
+
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
@@ -230,6 +232,18 @@ mod win_reap {
         ((ft.dw_high_date_time as u64) << 32) | (ft.dw_low_date_time as u64)
     }
 
+    pub fn process_creation_time(handle: *mut c_void) -> Option<u64> {
+        let mut created: FileTime = unsafe { std::mem::zeroed() };
+        let mut exit: FileTime = unsafe { std::mem::zeroed() };
+        let mut kernel: FileTime = unsafe { std::mem::zeroed() };
+        let mut user: FileTime = unsafe { std::mem::zeroed() };
+        if unsafe { GetProcessTimes(handle, &mut created, &mut exit, &mut kernel, &mut user) } == 0 {
+            None
+        } else {
+            Some(ft_to_u64(&created))
+        }
+    }
+
     pub(crate) fn normalize_win_path(p: &str) -> String {
         let trimmed = p.trim();
         let stripped = trimmed
@@ -440,6 +454,52 @@ mod win_reap {
         }
         pids
     }
+
+    pub fn agy_ancestor() -> Option<(u32, u64)> {
+        let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+        if snap.is_null() || snap == INVALID_HANDLE {
+            return None;
+        }
+        let _guard = HandleGuard(snap);
+        let mut parents = std::collections::HashMap::new();
+        let mut entry: ProcessEntry32W = unsafe { std::mem::zeroed() };
+        entry.dw_size = std::mem::size_of::<ProcessEntry32W>() as u32;
+        if unsafe { Process32FirstW(snap, &mut entry) } == 0 {
+            return None;
+        }
+        loop {
+            parents.insert(
+                entry.th32_process_id,
+                (
+                    entry.th32_parent_process_id,
+                    wide_z_to_string(&entry.sz_exe_file).eq_ignore_ascii_case("agy.exe"),
+                ),
+            );
+            if unsafe { Process32NextW(snap, &mut entry) } == 0 {
+                break;
+            }
+        }
+        let mut pid = std::process::id();
+        let mut child_created = u64::MAX;
+        for _ in 0..64 {
+            let &(parent, is_agy) = parents.get(&pid)?;
+            let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+            if handle.is_null() {
+                return None;
+            }
+            let _guard = HandleGuard(handle);
+            let created = process_creation_time(handle)?;
+            if created > child_created {
+                return None;
+            }
+            if is_agy {
+                return Some((pid, created));
+            }
+            child_created = created;
+            pid = parent;
+        }
+        None
+    }
 }
 
 #[cfg(windows)]
@@ -522,10 +582,8 @@ mod win_watch {
         }
     }
 
-    /// Global single-instance watcher: blocks in the kernel on all live `agy.exe` handles
-    /// via `WaitForMultipleObjects` (0% CPU). Whenever any `agy.exe` exits, reaps orphaned
-    /// suspended copies safely; once the last `agy.exe` exits, does a final `min_age=0`
-    /// sweep and exits itself.
+    /// One wait loop handles title deadlines, state notifications and process exits.
+    /// Animation wakes do not rescan the process table or run the orphan reaper.
     pub fn run_watcher(opts: WatcherOptions) {
         let name = to_wide_z(WATCHER_MUTEX_NAME);
         let mutex = unsafe { CreateMutexW(ptr::null_mut(), 0, name.as_ptr()) };
@@ -537,6 +595,12 @@ mod win_watch {
             return;
         }
 
+        let Some(title_event) = super::title::windows::update_event() else {
+            return;
+        };
+        // The watcher is detached, and attaches to one target console at a time.
+        super::title::windows::detach_console();
+
         let mut last_periodic_reap = Instant::now();
 
         loop {
@@ -544,7 +608,8 @@ mod win_watch {
             let mut guards: Vec<HandleGuard> = Vec::with_capacity(pids.len().min(MAXIMUM_WAIT_OBJECTS));
             let mut raw_handles: Vec<*mut c_void> = Vec::with_capacity(pids.len().min(MAXIMUM_WAIT_OBJECTS));
 
-            for pid in pids.into_iter().take(MAXIMUM_WAIT_OBJECTS) {
+            raw_handles.push(title_event.0);
+            for pid in pids.into_iter().take(MAXIMUM_WAIT_OBJECTS - 1) {
                 let h = unsafe { OpenProcess(SYNCHRONIZE, 0, pid) };
                 if !h.is_null() {
                     raw_handles.push(h);
@@ -552,19 +617,32 @@ mod win_watch {
                 }
             }
 
-            if raw_handles.is_empty() {
+            if guards.is_empty() {
                 thread::sleep(Duration::from_millis(opts.exit_settle_ms));
+                super::title::windows::tick();
                 let _ = win_reap::reap_orphaned_suspended_self(0);
                 break;
             }
 
-            let wait_res = unsafe {
-                WaitForMultipleObjects(
-                    raw_handles.len() as u32,
-                    raw_handles.as_ptr(),
-                    0, // Wake as soon as ANY monitored agy.exe exits.
-                    opts.poll_ms,
-                )
+            let scan_deadline = Instant::now() + Duration::from_millis(opts.poll_ms as u64);
+            let wait_res = loop {
+                let title_delay = super::title::windows::tick();
+                let scan_delay = scan_deadline.saturating_duration_since(Instant::now());
+                if scan_delay.is_zero() {
+                    break WAIT_TIMEOUT;
+                }
+                let timeout = title_delay.map_or(scan_delay, |delay| scan_delay.min(delay));
+                let result = unsafe {
+                    WaitForMultipleObjects(
+                        raw_handles.len() as u32,
+                        raw_handles.as_ptr(),
+                        0,
+                        timeout.as_millis().max(1) as u32,
+                    )
+                };
+                if result != WAIT_OBJECT_0 && result != WAIT_TIMEOUT {
+                    break result;
+                }
             };
 
             // Release process handles before sleeping/reaping so exited processes can finalize.
@@ -574,6 +652,7 @@ mod win_watch {
             if wait_res >= WAIT_OBJECT_0 && (wait_res - WAIT_OBJECT_0) < MAXIMUM_WAIT_OBJECTS as u32 {
                 thread::sleep(Duration::from_millis(opts.exit_settle_ms));
                 if win_reap::list_live_agy_pids().is_empty() {
+                    super::title::windows::tick();
                     let _ = win_reap::reap_orphaned_suspended_self(0);
                     break;
                 } else {
@@ -3554,42 +3633,6 @@ fn terminal_title_name(data: &JsonValue) -> String {
     "Antigravity".to_string()
 }
 
-fn resolve_terminal_title(data: &JsonValue) -> String {
-    let name = terminal_title_name(data);
-    let state = sanitize_json_str(data.get("agent_state")).to_ascii_lowercase();
-    let status = if data.get("tool_confirmation_pending").and_then(|v| v.as_bool()) == Some(true) {
-        "[ ! ] Action Required"
-    } else {
-        match state.as_str() {
-            "working" | "tool_use" | "reviewing" => "\u{25CC} Working",
-            "initializing" => "\u{25CC} Starting",
-            "authenticating" => "\u{25CC} Signing in",
-            "error" => "\u{2715} Error",
-            "idle" => {
-                let background_running = data.get("task_count").and_then(|v| v.as_i64()).unwrap_or(0) > 0
-                    || data.get("subagents").and_then(|v| v.as_array()).is_some_and(|subs| {
-                        subs.iter().any(|sub| {
-                            let status = sanitize_json_str(sub.get("status"));
-                            status.is_empty() || status == "running"
-                        })
-                    });
-                if background_running {
-                    "\u{25CC} Background"
-                } else {
-                    // Idle means ready for input, not that the requested task succeeded.
-                    "\u{1F7E2} Ready"
-                }
-            }
-            _ => "",
-        }
-    };
-    if status.is_empty() {
-        name
-    } else {
-        truncate_title(&format!("{status} \u{00B7} {name}"), 60)
-    }
-}
-
 fn set_terminal_title(title: &str) {
     #[cfg(windows)]
     {
@@ -3673,11 +3716,11 @@ fn run() {
             let payload =
                 JsonParser::parse(&input_json).unwrap_or_else(|_| JsonValue::Object(Vec::new()));
             if cfg.action_mode == ActionMode::Title {
-                write_stdout_line(&resolve_terminal_title(&payload));
+                write_stdout_line(&title::prepare(&payload, cfg.watch_agy));
                 return;
             }
             if cfg.set_title {
-                let title = resolve_terminal_title(&payload);
+                let title = title::prepare(&payload, cfg.watch_agy);
                 set_terminal_title(&title);
             }
             let rendered = render_status_line(&payload, &cfg, &theme);
@@ -3704,6 +3747,7 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    use super::title::resolve as resolve_terminal_title;
     use super::*;
 
     #[test]
@@ -3846,32 +3890,37 @@ mod tests {
     #[test]
     fn test_terminal_title_states_and_attention_priority() {
         for (state, prefix) in [
-            ("working", "\u{25CC} Working"),
-            ("tool_use", "\u{25CC} Working"),
-            ("reviewing", "\u{25CC} Working"),
-            ("initializing", "\u{25CC} Starting"),
-            ("authenticating", "\u{25CC} Signing in"),
-            ("idle", "\u{1F7E2} Ready"),
-            ("error", "\u{2715} Error"),
+            ("working", "\u{25D0}"),
+            ("tool_use", "\u{25D0}"),
+            ("reviewing", "\u{25D0}"),
+            ("initializing", "\u{25D0}"),
+            ("authenticating", "\u{25D0}"),
+            ("idle", ""),
+            ("error", "\u{1F534}"),
         ] {
             let data = JsonParser::parse(&format!(
                 r#"{{"agent_state":"{state}","conversation_title":"Fix authentication"}}"#,
             )).unwrap();
-            assert_eq!(resolve_terminal_title(&data), format!("{prefix} \u{00B7} Fix authentication"));
+            let expected = if prefix.is_empty() {
+                "Fix authentication".to_string()
+            } else {
+                format!("{prefix} Fix authentication")
+            };
+            assert_eq!(resolve_terminal_title(&data), expected);
             let pending = JsonParser::parse(&format!(
                 r#"{{"agent_state":"{state}","tool_confirmation_pending":true,"task_count":1}}"#,
             )).unwrap();
-            assert_eq!(resolve_terminal_title(&pending), "[ ! ] Action Required \u{00B7} Antigravity");
+            assert_eq!(resolve_terminal_title(&pending), "[ ! ] Antigravity");
         }
         for raw in [
             r#"{"agent_state":"idle","task_count":1}"#,
             r#"{"agent_state":"idle","subagents":[{"status":"running"}]}"#,
             r#"{"agent_state":"idle","subagents":[{"name":"worker"}]}"#,
         ] {
-            assert_eq!(resolve_terminal_title(&JsonParser::parse(raw).unwrap()), "\u{25CC} Background \u{00B7} Antigravity");
+            assert_eq!(resolve_terminal_title(&JsonParser::parse(raw).unwrap()), "\u{25D0} Antigravity");
         }
         let completed = JsonParser::parse(r#"{"agent_state":"idle","task_count":0,"subagents":[{"status":"completed"}]}"#).unwrap();
-        assert_eq!(resolve_terminal_title(&completed), "\u{1F7E2} Ready \u{00B7} Antigravity");
+        assert_eq!(resolve_terminal_title(&completed), "Antigravity");
         let unknown = JsonParser::parse(r#"{"agent_state":"future","conversation_title":"Session"}"#).unwrap();
         assert_eq!(resolve_terminal_title(&unknown), "Session");
     }
@@ -3881,14 +3930,14 @@ mod tests {
         let data = JsonParser::parse(
             r#"{"conversation_title":"  Fix\t\u001b[31mauth\u001b[0m\n\u202ereview\u2069\u009d\u001b]0;injected\u0007  ","agent_state":"working"}"#,
         ).unwrap();
-        assert_eq!(resolve_terminal_title(&data), "\u{25CC} Working \u{00B7} Fix auth review");
+        assert_eq!(resolve_terminal_title(&data), "\u{25D0} Fix auth review");
         let invisible = JsonParser::parse(r#"{"conversation_title":"\u202e\u2069","cwd":"/work/demo"}"#).unwrap();
         assert_eq!(resolve_terminal_title(&invisible), "demo");
         let long = JsonParser::parse(&format!(
             r#"{{"agent_state":"working","conversation_title":"{}"}}"#, "界".repeat(80),
         )).unwrap();
         let title = resolve_terminal_title(&long);
-        assert!(title.starts_with("\u{25CC} Working \u{00B7} "));
+        assert!(title.starts_with("\u{25D0} "));
         assert!(title.ends_with('\u{2026}'));
         assert!(display_width(&title) <= 60);
     }
