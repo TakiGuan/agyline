@@ -592,7 +592,7 @@ mod win_watch {
     }
 }
 
-const SCRIPT_VERSION: &str = "2.0.7";
+const SCRIPT_VERSION: &str = "2.0.8";
 const GIT_CACHE_TTL_MS: i64 = 5_000;
 const GIT_CACHE_MAX_STALE_MS: i64 = 10 * 60 * 1_000;
 const GIT_REFRESH_TIMEOUT_MS: u64 = 10_000;
@@ -609,7 +609,7 @@ const DEFAULT_CONFIG_TOML: &str = r#"# agyline configuration (optional; zero-con
 # Precedence: CLI flags > this file > built-in defaults.
 
 glyphs = "nerd"          # "nerd" | "classic"
-title = true             # Sync conversation_title to Windows Terminal tab
+title = true             # Direct Windows title sync, disable when using title.command
 
 [layout]
 width = "auto"           # "auto" or integer column count
@@ -651,6 +651,7 @@ static GIT_REFRESH_SPAWNED: AtomicBool = AtomicBool::new(false);
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ActionMode {
     Render,
+    Title,
     Version,
     Legend,
     Preview,
@@ -1033,6 +1034,7 @@ impl Config {
                 "--version" | "-version" | "-v" => self.action_mode = ActionMode::Version,
                 "--legend" | "-legend" | "-l" => self.action_mode = ActionMode::Legend,
                 "--preview" | "-preview" => self.action_mode = ActionMode::Preview,
+                "--title" => self.action_mode = ActionMode::Title,
                 "--init-config" | "-initconfig" => self.action_mode = ActionMode::InitConfig,
                 "--refresh-git" | "refresh-git" => {
                     self.action_mode = ActionMode::RefreshGit;
@@ -1146,6 +1148,9 @@ struct Theme {
     ic_subagents: &'static str,
     ic_tasks: &'static str,
     ic_artifacts: &'static str,
+    ic_mode_plan: &'static str,
+    ic_mode_auto: &'static str,
+    ic_mode_edits: &'static str,
     ic_clean: &'static str,
     ic_dirty: &'static str,
     ic_conflict: &'static str,
@@ -1174,10 +1179,13 @@ impl Theme {
             ic_subagents,
             ic_tasks,
             ic_artifacts,
+            ic_mode_plan,
+            ic_mode_auto,
+            ic_mode_edits,
         ) = if use_classic {
             (
                 "\u{25C6}", "\u{25A3}", "\u{2387}", "\u{25D4}", "\u{2248}", "\u{25F7}", "", "@",
-                "*", "#",
+                "*", "#", "\u{2261}", "\u{00BB}", "\u{270E}",
             )
         } else {
             (
@@ -1191,6 +1199,9 @@ impl Theme {
                 "\u{F167A}",
                 "\u{F0AE}",
                 "\u{F0F6}",
+                "\u{F0A38}", // nf-md-clipboard_text_outline
+                "\u{F140B}", // nf-md-lightning_bolt
+                "\u{F0CB6}", // nf-md-pencil_outline
             )
         };
 
@@ -1220,6 +1231,9 @@ impl Theme {
             ic_subagents,
             ic_tasks,
             ic_artifacts,
+            ic_mode_plan,
+            ic_mode_auto,
+            ic_mode_edits,
             ic_clean: "\u{2713}",
             ic_dirty: "\u{25CF}",
             ic_conflict: "\u{26A0}",
@@ -2867,24 +2881,26 @@ fn build_cache_item(data: &JsonValue, t: &Theme) -> Option<Item> {
 
 fn build_mode_item(data: &JsonValue, t: &Theme) -> Option<Item> {
     let mode = sanitize_json_str(data.get("cycle_mode"));
-    if mode.is_empty() || mode == "default" {
+    let low = mode.to_ascii_lowercase();
+    if mode.is_empty() || low == "default" {
         return None;
     }
-    let low = mode.to_ascii_lowercase();
-    let color = match low.as_str() {
-        "plan" => t.c_model,
-        "auto" => t.c_ok,
-        "accept-edits" => t.c_warn,
-        _ => t.c_muted,
+    let (color, icon) = match low.as_str() {
+        "plan" => (t.c_model, t.ic_mode_plan),
+        "auto" => (t.c_ok, t.ic_mode_auto),
+        "accept-edits" => (t.c_warn, t.ic_mode_edits),
+        _ => (t.c_muted, ""),
     };
     let short = if low == "accept-edits" {
         "edits"
     } else {
         mode.as_str()
     };
-    let full = format!("{color}{mode}{}", t.c_reset);
-    let compact = format!("{color}{short}{}", t.c_reset);
-    Item::new(3, full, compact.clone(), compact)
+    let gap = if icon.is_empty() { "" } else { " " };
+    let full = format!("{color}{icon}{gap}{mode}{}", t.c_reset);
+    let compact = format!("{color}{icon}{gap}{short}{}", t.c_reset);
+    let minimal = format!("{color}{short}{}", t.c_reset);
+    Item::new(3, full, compact, minimal)
 }
 
 fn build_activity_item(data: &JsonValue, cfg: &Config, t: &Theme) -> Option<Item> {
@@ -3423,8 +3439,10 @@ fn print_legend(t: &Theme) {
         String::new(),
         "Right segments (Antigravity native, hidden when empty):".to_string(),
         format!(
-            "  {}plan{} / {}auto{} / {}edits{}          Active cycle_mode (Shift+Tab)",
-            t.c_model, t.c_reset, t.c_ok, t.c_reset, t.c_warn, t.c_reset
+            "  {}{} plan{} / {}{} auto{} / {}{} edits{}    Active cycle_mode (Shift+Tab)",
+            t.c_model, t.ic_mode_plan, t.c_reset,
+            t.c_ok, t.ic_mode_auto, t.c_reset,
+            t.c_warn, t.ic_mode_edits, t.c_reset
         ),
         format!(
             "  {}{} 2{} {}{}{} {}{} 1{} {}{}{} {}{} 3{}         Running subagents, background tasks, artifacts",
@@ -3451,6 +3469,7 @@ fn print_legend(t: &Theme) {
         "  --no-model, --no-dir, --no-git, --no-context, --no-cache".to_string(),
         "  --no-mode, --no-vim, --no-activity (--no-subagents/--no-tasks/--no-artifacts)".to_string(),
         "  --no-quota, --no-cost, --no-title, --no-watch".to_string(),
+        "  --title                       Print a plain-text title for agy title.command".to_string(),
         "  --init-config, --preview [--width N], --legend, --version".to_string(),
     ];
     write_stdout_line(&lines.join("\n"));
@@ -3499,12 +3518,29 @@ fn truncate_title(s: &str, max_cols: usize) -> String {
     out.trim_end().to_string() + "\u{2026}"
 }
 
-fn resolve_terminal_title(data: &JsonValue) -> String {
-    let conv_title = sanitize_json_str(data.get("conversation_title"));
+fn sanitize_terminal_title(input: &str) -> String {
+    strip_ansi(input)
+        .chars()
+        .filter(|ch| {
+            (!ch.is_control() || ch.is_whitespace())
+                && !matches!(ch,
+                    '\u{00AD}' | '\u{061C}' | '\u{200B}'..='\u{200F}' |
+                    '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{206F}' | '\u{FEFF}')
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn terminal_title_name(data: &JsonValue) -> String {
+    let conv_title = sanitize_terminal_title(
+        data.get("conversation_title").and_then(|v| v.as_str()).unwrap_or(""),
+    );
     if !conv_title.is_empty() {
         return truncate_title(&conv_title, 60);
     }
-    let dir = extract_dir(data);
+    let dir = sanitize_terminal_title(&extract_dir(data));
     if !dir.is_empty() {
         let leaf = dir
             .split(|c| c == '\\' || c == '/')
@@ -3516,6 +3552,42 @@ fn resolve_terminal_title(data: &JsonValue) -> String {
         }
     }
     "Antigravity".to_string()
+}
+
+fn resolve_terminal_title(data: &JsonValue) -> String {
+    let name = terminal_title_name(data);
+    let state = sanitize_json_str(data.get("agent_state")).to_ascii_lowercase();
+    let status = if data.get("tool_confirmation_pending").and_then(|v| v.as_bool()) == Some(true) {
+        "[ ! ] Action Required"
+    } else {
+        match state.as_str() {
+            "working" | "tool_use" | "reviewing" => "\u{25CC} Working",
+            "initializing" => "\u{25CC} Starting",
+            "authenticating" => "\u{25CC} Signing in",
+            "error" => "\u{2715} Error",
+            "idle" => {
+                let background_running = data.get("task_count").and_then(|v| v.as_i64()).unwrap_or(0) > 0
+                    || data.get("subagents").and_then(|v| v.as_array()).is_some_and(|subs| {
+                        subs.iter().any(|sub| {
+                            let status = sanitize_json_str(sub.get("status"));
+                            status.is_empty() || status == "running"
+                        })
+                    });
+                if background_running {
+                    "\u{25CC} Background"
+                } else {
+                    // Idle means ready for input, not that the requested task succeeded.
+                    "\u{1F7E2} Ready"
+                }
+            }
+            _ => "",
+        }
+    };
+    if status.is_empty() {
+        name
+    } else {
+        truncate_title(&format!("{status} \u{00B7} {name}"), 60)
+    }
 }
 
 fn set_terminal_title(title: &str) {
@@ -3596,10 +3668,14 @@ fn run() {
                 reap_min_age_secs: cfg.reap_min_age_secs,
             });
         }
-        ActionMode::Render => {
+        ActionMode::Render | ActionMode::Title => {
             let input_json = read_bounded_stdin(STDIN_TIMEOUT_MS);
             let payload =
                 JsonParser::parse(&input_json).unwrap_or_else(|_| JsonValue::Object(Vec::new()));
+            if cfg.action_mode == ActionMode::Title {
+                write_stdout_line(&resolve_terminal_title(&payload));
+                return;
+            }
             if cfg.set_title {
                 let title = resolve_terminal_title(&payload);
                 set_terminal_title(&title);
@@ -3732,6 +3808,92 @@ mod tests {
     }
 
     #[test]
+    fn test_mode_icons_and_narrow_layout() {
+        for classic in [false, true] {
+            let theme = Theme::new(classic, false);
+            for (mode, short, icon) in [
+                ("plan", "plan", if classic { "\u{2261}" } else { "\u{F0A38}" }),
+                ("auto", "auto", if classic { "\u{00BB}" } else { "\u{F140B}" }),
+                ("accept-edits", "edits", if classic { "\u{270E}" } else { "\u{F0CB6}" }),
+            ] {
+                let data = JsonParser::parse(&format!(r#"{{"cycle_mode":"{mode}"}}"#)).unwrap();
+                let item = build_mode_item(&data, &theme).unwrap();
+                assert_eq!(strip_ansi(&item.variants[0]), format!("{icon} {mode}"));
+                assert_eq!(strip_ansi(&item.variants[1]), format!("{icon} {short}"));
+                assert_eq!(strip_ansi(&item.variants[2]), short);
+
+                let mut cfg = Config::default();
+                cfg.show_model = false;
+                cfg.show_dir = false;
+                cfg.show_git = false;
+                cfg.show_context = false;
+                for width in [20, 40, 80] {
+                    cfg.width_override = width;
+                    let rendered = render_status_line(&data, &cfg, &theme);
+                    assert!(rendered.contains(short));
+                    assert!(rendered.lines().all(|line| display_width(line) <= width));
+                }
+            }
+        }
+        let theme = Theme::new(false, true);
+        let unknown = JsonParser::parse(r#"{"cycle_mode":"future"}"#).unwrap();
+        assert_eq!(build_mode_item(&unknown, &theme).unwrap().variants[0], "future");
+        for raw in [r#"{}"#, r#"{"cycle_mode":"default"}"#, r#"{"cycle_mode":"DEFAULT"}"#] {
+            assert!(build_mode_item(&JsonParser::parse(raw).unwrap(), &theme).is_none());
+        }
+    }
+
+    #[test]
+    fn test_terminal_title_states_and_attention_priority() {
+        for (state, prefix) in [
+            ("working", "\u{25CC} Working"),
+            ("tool_use", "\u{25CC} Working"),
+            ("reviewing", "\u{25CC} Working"),
+            ("initializing", "\u{25CC} Starting"),
+            ("authenticating", "\u{25CC} Signing in"),
+            ("idle", "\u{1F7E2} Ready"),
+            ("error", "\u{2715} Error"),
+        ] {
+            let data = JsonParser::parse(&format!(
+                r#"{{"agent_state":"{state}","conversation_title":"Fix authentication"}}"#,
+            )).unwrap();
+            assert_eq!(resolve_terminal_title(&data), format!("{prefix} \u{00B7} Fix authentication"));
+            let pending = JsonParser::parse(&format!(
+                r#"{{"agent_state":"{state}","tool_confirmation_pending":true,"task_count":1}}"#,
+            )).unwrap();
+            assert_eq!(resolve_terminal_title(&pending), "[ ! ] Action Required \u{00B7} Antigravity");
+        }
+        for raw in [
+            r#"{"agent_state":"idle","task_count":1}"#,
+            r#"{"agent_state":"idle","subagents":[{"status":"running"}]}"#,
+            r#"{"agent_state":"idle","subagents":[{"name":"worker"}]}"#,
+        ] {
+            assert_eq!(resolve_terminal_title(&JsonParser::parse(raw).unwrap()), "\u{25CC} Background \u{00B7} Antigravity");
+        }
+        let completed = JsonParser::parse(r#"{"agent_state":"idle","task_count":0,"subagents":[{"status":"completed"}]}"#).unwrap();
+        assert_eq!(resolve_terminal_title(&completed), "\u{1F7E2} Ready \u{00B7} Antigravity");
+        let unknown = JsonParser::parse(r#"{"agent_state":"future","conversation_title":"Session"}"#).unwrap();
+        assert_eq!(resolve_terminal_title(&unknown), "Session");
+    }
+
+    #[test]
+    fn test_terminal_title_sanitization_and_total_width() {
+        let data = JsonParser::parse(
+            r#"{"conversation_title":"  Fix\t\u001b[31mauth\u001b[0m\n\u202ereview\u2069\u009d\u001b]0;injected\u0007  ","agent_state":"working"}"#,
+        ).unwrap();
+        assert_eq!(resolve_terminal_title(&data), "\u{25CC} Working \u{00B7} Fix auth review");
+        let invisible = JsonParser::parse(r#"{"conversation_title":"\u202e\u2069","cwd":"/work/demo"}"#).unwrap();
+        assert_eq!(resolve_terminal_title(&invisible), "demo");
+        let long = JsonParser::parse(&format!(
+            r#"{{"agent_state":"working","conversation_title":"{}"}}"#, "界".repeat(80),
+        )).unwrap();
+        let title = resolve_terminal_title(&long);
+        assert!(title.starts_with("\u{25CC} Working \u{00B7} "));
+        assert!(title.ends_with('\u{2026}'));
+        assert!(display_width(&title) <= 60);
+    }
+
+    #[test]
     fn test_resolve_terminal_title() {
         let with_title = JsonParser::parse(
             r#"{"conversation_title":"Diagnose statusline & theme","workspace":{"current_dir":"C:\\Work\\demo"}}"#,
@@ -3796,6 +3958,10 @@ mod tests {
 
         let init_cfg = Config::parse_args(vec!["--init-config".to_string()]);
         assert!(init_cfg.action_mode == ActionMode::InitConfig);
+
+        let title_cfg = Config::parse_args(vec!["--title".to_string(), "--no-title".to_string()]);
+        assert!(title_cfg.action_mode == ActionMode::Title);
+        assert!(!title_cfg.set_title);
     }
 
     #[test]
